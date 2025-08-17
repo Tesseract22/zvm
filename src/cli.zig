@@ -15,6 +15,7 @@ pub const ArgParser = struct {
     root_command: *Command = undefined,
 
     pub fn init(self: *ArgParser, a: std.mem.Allocator, pgm_name: []const u8, desc: []const u8) void {
+        self.commands = .{};
         self.commands.append(a, .{.root = self, .desc = desc, .name = pgm_name}) catch unreachable;
         self.a = a;
         self.root_command = self.commands.at(0);
