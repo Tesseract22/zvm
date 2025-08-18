@@ -274,14 +274,14 @@ fn read_list(str: []const u8, a: Allocator) !std.StringArrayHashMapUnmanaged(voi
 fn ask_for_yes(stdin: *std.fs.File, comptime fmt: []const u8, args: anytype) bool {
     print(fmt ++ "\n", args);
     print("y[es], n[o]?\n", .{});
-    const reader = stdin.reader();
     var buf: [32]u8 = undefined;
+    var reader = stdin.reader(&buf);
     var buf2: [32]u8 = undefined;
-    const yes_or_no = reader.readUntilDelimiterOrEof(&buf, '\n') catch |e| {
+    const yes_or_no = reader.interface.takeSentinel('\n') catch |e| {
         if (e == error.StreamTooLong) return ask_for_yes(stdin, fmt, args);
         std.log.err("{}: you mean no? fine.", .{e});
         return false;
-    } orelse return false;
+    };
     const lower = std.ascii.lowerString(&buf2, yes_or_no);
     if (std.mem.eql(u8, lower, "y") or std.mem.eql(u8, lower, "yes")) return true;
     if (std.mem.eql(u8, lower, "n") or std.mem.eql(u8, lower, "no")) return false;
@@ -294,7 +294,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
-    var stdin = std.io.getStdIn();
+    var stdin = std.fs.File.stdin();
 
     //
     // cli
@@ -583,7 +583,10 @@ pub fn main() !void {
 
         // get the last component of tarball, i.e. the name of the tarball
         const tarball_uri = try std.Uri.parse(download.tarball);
-        const path = try allocPrint(a, "{path}", .{tarball_uri.path});
+        var alloc_writer = std.io.Writer.Allocating.init(a);
+        defer alloc_writer.deinit();
+        try tarball_uri.path.formatPath(&alloc_writer.writer);
+        const path = try alloc_writer.toOwnedSlice();
         defer a.free(path);
 
         const tarball_name = std.fs.path.basename(path);
