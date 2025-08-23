@@ -16,7 +16,9 @@ const Cli = @import("cli.zig");
 const Latency = struct {i64, []const u8};
 
 const Index = json.ArrayHashMap(Release);
+const fatal = std.process.fatal;
 
+const temp_folder = if (builtin.target.os.tag == .windows) "~/AppData/Local/Temp/" else "/tmp/";
 
 const Release = struct {
     version: []const u8 = "", // only available when its is a master
@@ -111,13 +113,13 @@ const Error = error {
 const Options = struct {
     install: struct {
         release: []const u8,
-        mirror: []const u8,
+        mirror: ?[]const u8,
         fetch: bool,
     },
 
     release: struct {
         fetch: bool, 
-        name: []const u8
+        name: ?[]const u8
     },
 
     list: struct {
@@ -129,10 +131,6 @@ const Options = struct {
     },
 };
 
-// fn parse_index(scanner: *json.Scanner) !Index {
-// 
-// }
-
 fn free_index(index: *Index, a: Allocator) void {
     var index_it = index.map.iterator();
     while (index_it.next()) |entry| {
@@ -143,23 +141,23 @@ fn free_index(index: *Index, a: Allocator) void {
 
 }
 
-fn cal_fastest_mirror(client: *std.http.Client, mirror_list: []const u8, a: Allocator) !struct {i64, []const u8} {
-    var mirror_it = std.mem.tokenizeScalar(u8, mirror_list, '\n');
+fn cal_fastest_mirror(client: *std.http.Client, mirror_cfg: FileConfigSet, a: Allocator) !struct {i64, []const u8} {
+    var mirror_it = mirror_cfg.set.iterator();
     var latencies = std.ArrayListUnmanaged(Latency) {};
     defer latencies.deinit(a);
     while (mirror_it.next()) |mirror| {
         const start_t = std.time.milliTimestamp();
         _ = client.fetch(.{
-            .location = .{.url = mirror},
+            .location = .{.url = mirror.key_ptr.*},
             .keep_alive = false,
         }) catch |e| {
-            std.log.err("{} cannot connect to mirror {s}. skipping.", .{e, mirror});
+            std.log.err("{} cannot connect to mirror {s}. skipping.", .{e, mirror.key_ptr.*});
             continue;
         };
         const end_t = std.time.milliTimestamp();
         const latency = end_t-start_t;
-        try latencies.append(a, .{latency, mirror});
-        std.log.debug("mirror: {s} {}ms", .{mirror, latency});
+        try latencies.append(a, .{latency, mirror.key_ptr.*});
+        std.log.debug("mirror: {s} {}ms", .{mirror.key_ptr.*, latency});
     }
     const start_t = std.time.milliTimestamp();
     if (client.fetch(.{
@@ -197,9 +195,7 @@ fn download_tarball(url: []const u8, output_path: []const u8, a: Allocator) !voi
     }
 }
 
-fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, client: *std.http.Client, a: Allocator) !void {
-    const sig_url = try allocPrint(a, "{s}/{s}.minisig", .{official_builds, tarball_name});
-    defer a.free(sig_url);
+fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, sig_url: []const u8, client: *std.http.Client, a: Allocator) !void {
     var buf: [1024]u8 = undefined;
     var storage = std.ArrayListUnmanaged(u8) {.items = &buf, .capacity = buf.len};
     storage.shrinkRetainingCapacity(0);
@@ -209,7 +205,7 @@ fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, client: *s
         .response_storage = .{ .static = &storage },
     });
     if (resp.status != .ok) return Error.SignatureError;
-    const sig_path = try allocPrint(a, "/tmp/{s}.minisig", .{tarball_name});
+    const sig_path = try allocPrint(a, temp_folder ++ "/{s}.minisig", .{tarball_name});
     defer a.free(sig_path);
     {
         var sig_f = try std.fs.createFileAbsolute(sig_path, .{.truncate = true});
@@ -219,7 +215,10 @@ fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, client: *s
 
     var minisign = std.process.Child.init(&.{"minisign", "-Vm", tarball_path, "-P", public_key, "-x", sig_path}, a);
     minisign.stdin_behavior = .Pipe;
-    try minisign.spawn();
+    minisign.spawn() catch |e| {
+        if (e == error.FileNotFound) std.log.err("program `minisign` is not installed or available in $PATH", .{});
+        return e;
+    };
     try minisign.stdin.?.writeAll(storage.items);
     switch (try minisign.wait()) {
         .Exited => |exit_code| {
@@ -232,7 +231,7 @@ fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, client: *s
         }
     }
 }
-// https://ziglang.org/builds/zig-0.15.0-dev.1519+dd4e25cf4.tar.xz.minisig
+
 fn decompress_tarball(tarball_path: []const u8, output_dir: []const u8, a: Allocator) !void {
     var tar = std.process.Child.init(&.{"tar", "xf", tarball_path, "-C", output_dir}, a);
     const tar_term = try tar.spawnAndWait();
@@ -270,7 +269,6 @@ fn read_list(str: []const u8, a: Allocator) !std.StringArrayHashMapUnmanaged(voi
     return map;
 }
 
-
 fn ask_for_yes(stdin: *std.fs.File, comptime fmt: []const u8, args: anytype) bool {
     print(fmt ++ "\n", args);
     print("y[es], n[o]?\n", .{});
@@ -289,10 +287,142 @@ fn ask_for_yes(stdin: *std.fs.File, comptime fmt: []const u8, args: anytype) boo
 
 }
 
+const FileConfig = struct {
+    file: std.fs.File,
+    buf: []const u8,
+    dirty: bool, // if dirty, commit will overwrite the file.
+
+    const MAX_FETCH_SIZE = 1024 * 100;
+    pub fn init(zvm_dir: *std.fs.Dir, name: []const u8, arena: Allocator) !FileConfig {
+        var file = try zvm_dir.createFile(name, .{ .truncate = false, .read = true });
+        var buf: [256]u8 = undefined;
+        var reader = file.reader(&buf);
+        const buf2 = try reader.interface.allocRemaining(arena, .unlimited);
+        return .{ .file = file, .buf = buf2, .dirty = false };
+    }
+
+    pub fn fetch(self: *FileConfig, url: []const u8, client: *std.http.Client, arena: Allocator) !void {
+        var buf: [MAX_FETCH_SIZE]u8 = undefined;
+        var storage = std.ArrayListUnmanaged(u8).initBuffer(&buf);
+        const resp = try client.fetch(.{
+            .location = .{.url = url},
+            .response_storage = .{.static = &storage },
+        });
+        if (resp.status != .ok) return Error.NetworkError;
+        std.log.debug("storage: {}", .{storage.items.len});
+        self.overwrite(try arena.dupe(u8, storage.items));
+        self.dirty = true;
+    }
+
+    pub fn fetch_if_empty_or_force(self: *FileConfig, url: []const u8, client: *std.http.Client, force_fetch: bool, arena: Allocator) !void {
+        if (force_fetch or self.buf.len == 0) return self.fetch(url, client, arena);
+    }
+
+    pub fn commit(self: *FileConfig) !void {
+        if (self.dirty) {
+            try self.file.seekTo(0);
+            try self.file.setEndPos(0);
+            try self.file.writeAll(self.buf);
+        }
+        self.file.close();
+    }
+
+    pub fn clear(self: *FileConfig) void {
+        self.buf = &.{};
+        self.dirty = true;
+    }
+
+    pub fn overwrite(self: *FileConfig, new: []const u8) void {
+        self.buf = new;
+        self.dirty = true;
+    }
+};
+
+const FileConfigSet = struct {
+    const MAX_FETCH_SIZE = 2048;
+    const SetError = error {
+        DuplicateEntry,
+    };
+    file: std.fs.File,
+    set: std.StringArrayHashMapUnmanaged(void),
+    dirty: bool,
+
+    pub fn init(zvm_dir: *std.fs.Dir, name: []const u8, arena: Allocator) !FileConfigSet {
+        var file = try zvm_dir.createFile(name, .{ .truncate = false, .read = true });
+        var buf: [256]u8 = undefined;
+        var reader = file.reader(&buf);
+        const buf2 = try reader.interface.allocRemaining(arena, .unlimited);
+        var cfg = FileConfigSet {.file = file, .set = .empty, .dirty = false}; 
+        try cfg.overwrite(buf2, arena);
+        return cfg;
+    }
+
+    pub fn overwrite(self: *FileConfigSet, buf: []const u8, arena: Allocator) !void {
+        self.set.clearRetainingCapacity();
+        const count = blk: {
+            var lines = std.mem.tokenizeScalar(u8, buf, '\n');
+            var count: usize = 0;
+            while (lines.next()) |_| {
+                count += 1;
+            }
+            break :blk count;
+        };
+        self.set.ensureTotalCapacity(arena, count) catch unreachable;
+        var lines = std.mem.tokenizeScalar(u8, buf, '\n');
+        while (lines.next()) |line| {
+            if (self.set.fetchPut(arena, line, {}) catch unreachable) |_|
+                return SetError.DuplicateEntry;
+        }
+        assert(self.set.count() == count);
+        self.dirty = true;
+    }
+
+    pub fn append_line(self: *FileConfigSet, buf: []const u8, arena: Allocator) !void {
+        if (self.set.fetchPut(arena, buf, {}) catch unreachable) |_| return SetError.DuplicateEntry;
+        self.dirty = true;
+    }
+
+    pub fn commit(self: *FileConfigSet) !void {
+        if (self.dirty) {
+            try self.file.seekTo(0);
+            try self.file.setEndPos(0);
+            var it = self.set.iterator();
+            while (it.next()) |entry| {
+                try self.file.writeAll(entry.key_ptr.*);
+            }
+        }
+        self.file.close();
+    }
+
+    pub fn get(self: FileConfigSet, key: []const u8) bool {
+        return self.set.get(key) != null;
+    }
+
+    pub fn fetch(self: *FileConfigSet, url: []const u8, client: *std.http.Client, arena: Allocator) !void {
+        var buf: [MAX_FETCH_SIZE]u8 = undefined;
+        var storage = std.ArrayListUnmanaged(u8).initBuffer(&buf);
+        const resp = try client.fetch(.{
+            .location = .{.url = url},
+            .response_storage = .{.static = &storage },
+        });
+        if (resp.status != .ok) return Error.NetworkError;
+        try self.overwrite(arena.dupe(u8, storage.items) catch unreachable, arena);
+        self.dirty = true;
+    }
+
+    pub fn fetch_if_empty_or_force(self: *FileConfigSet, url: []const u8, client: *std.http.Client, force_fetch: bool, arena: Allocator) !void {
+        if (force_fetch or self.set.count() == 0) return self.fetch(url, client, arena);
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}) {};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
+
+    var arena_alloc = std.heap.ArenaAllocator.init(a);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
 
     var stdin = std.fs.File.stdin();
 
@@ -305,31 +435,33 @@ pub fn main() !void {
     arg_parser.init(a, args.next().?, "zig package manager");
     defer arg_parser.deinit();
 
+    // TODO: `nuke` command that remove entire installation
+    // `add` command that adds a local folder to the list of installation
     const release_cmd = 
         arg_parser.sub_command("release", "(fetch and) list the currently avaiable releases")
-        .add_opt(bool, &opts.release.fetch, &false, .{.prefix = "--fetch"}, "", "update the index of releases")
-        .add_opt([]const u8, &opts.release.name, &"", .positional, "<release-name>", "print details for this specific release");
+        .add_opt(bool, &opts.release.fetch, .{.just = &false}, .{.prefix = "--fetch"}, "", "update the index of releases")
+        .add_opt(?[]const u8, &opts.release.name, .{.just = &null}, .positional, "<release-name>", "print details for this specific release");
 
     const install_cmd = 
         arg_parser.sub_command("install", "install a release")
-        .add_opt([]const u8, &opts.install.release, null, .positional, "<release>", "the releaset to download, see `zvm list`")
-        .add_opt([]const u8, &opts.install.mirror, &"", .{.prefix = "--mirror"}, "<mirror>", "the mirror to use")
-        .add_opt(bool, &opts.install.fetch, &false, .{.prefix = "--fetch"}, "", "fetch the latest index and mirrors before install");
+        .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to download, see `zvm list`")
+        .add_opt(?[]const u8, &opts.install.mirror, .{.just = &null}, .{.prefix = "--mirror"}, "<mirror>", "the mirror to use")
+        .add_opt(bool, &opts.install.fetch, .{.just = &false}, .{.prefix = "--fetch"}, "", "fetch the latest index and mirrors before install");
 
     const uninstall_cmd = 
         arg_parser.sub_command("uninstall", "uninstall a release")
-        .add_opt([]const u8, &opts.install.release, null, .positional, "<release>", "the releaset to uninstall, see `zvm list`");
+        .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to uninstall, see `zvm list`");
 
     const mirror_cmd = 
         arg_parser.sub_command("mirror", "fetch and list all the known mirrors")
-        .add_opt(bool, &opts.mirror.fetch, &false, .{.prefix = "--fetch"}, "", "update the list of mirror");
+        .add_opt(bool, &opts.mirror.fetch, .{.just = &false}, .{.prefix = "--fetch"}, "", "update the list of mirror");
 
     const list_cmd = arg_parser.sub_command("list", "list all current installation");
     // list_cmd.add_opt(bool, &opts.list.valididate, &false, .{.prefix = "--valid"}, "validate and fix the current installation", a);
 
     const use_cmd = 
         arg_parser.sub_command("use", "use an installation")
-        .add_opt([]const u8, &opts.install.release, null, .positional, "<release>", "the release to use");
+        .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the release to use");
 
     try arg_parser.parse(&args);
     opts.mirror.fetch = opts.mirror.fetch or opts.install.fetch;
@@ -343,119 +475,87 @@ pub fn main() !void {
     // 
     // create zvm config path if not eixst
     //
-    
+
     var env = try std.process.getEnvMap(a);
     defer env.deinit();
     const home = env.get("HOME").?;
     const zvm_path = try std.fs.path.resolvePosix(a, &.{home, ".zvm"});
     defer a.free(zvm_path);
-        var zvm_dir = std.fs.openDirAbsolute(zvm_path, .{.iterate = true}) catch |e| 
+    var zvm_dir = std.fs.openDirAbsolute(zvm_path, .{.iterate = true}) catch |e| 
         if (e == error.FileNotFound) blk: {
             if (!ask_for_yes(&stdin, "creating {s}. You can delete it anytime", .{zvm_path})) return;
             try std.fs.makeDirAbsolute(zvm_path);
             break :blk try std.fs.openDirAbsolute(zvm_path, .{.iterate = true});
         } else return e
-    ;
+            ;
     defer zvm_dir.close();
 
-    
+
     var client = std.http.Client {.allocator = a};
     defer client.deinit();
+
+    // // this does not work, likely because of bug https://github.com/ziglang/zig/issues/19878
+    // try client.initDefaultProxies(arena);
+    // std.log.info("using proxy from env: {s}:{}", .{client.https_proxy.?.host, client.https_proxy.?.port});
+    // assert((try client.fetch(.{.location = .{.url = "http://github.com"}})).status == .ok);
 
     //
     // fetch or read index from cached
     //
-    var index_f = try zvm_dir.createFile("index.json", .{.truncate = false, .read = true});
-    defer index_f.close();
+    var index_cfg = try FileConfig.init(&zvm_dir, "index.json", arena);
+    defer index_cfg.commit() catch unreachable;
+    try index_cfg.fetch_if_empty_or_force(official_download ++ "/index.json", &client, opts.release.fetch, arena);
 
-    const index_str = if (opts.release.fetch or (try zvm_dir.statFile("index.json")).size == 0) blk: {
-        std.log.debug("fetch index...", .{});
-        var index_storage = std.ArrayList(u8).init(a);
-        defer index_storage.deinit();
-        const resp = try client.fetch(.{
-            .location = .{.url = official_download ++ "/index.json"},
-            .response_storage = .{.dynamic = &index_storage},
-        });
-        if (resp.status != .ok) {
-            std.log.err("failed to fetch index from {s}", .{official_download ++ "/index.json"});
-            return Error.NetworkError;
-        }
-        try index_f.seekTo(0);
-        try index_f.setEndPos(0);
-        try index_f.writeAll(index_storage.items);
-        break :blk try index_storage.toOwnedSlice();
-    } else blk: {
-        std.log.debug("reading index from cached...", .{});
-        break :blk try index_f.readToEndAlloc(a, 1024*1024);
-    };
-    defer a.free(index_str);
-    var json_obj = json.Scanner.initCompleteInput(a, index_str); 
+    var json_obj = json.Scanner.initCompleteInput(a, index_cfg.buf); 
     defer json_obj.deinit();
     var index = Index.jsonParse(a, &json_obj, .{.ignore_unknown_fields = true, .allocate = .alloc_always, .max_value_len = 1024}) catch |e| {
+        std.log.debug("index buffer: {s}", .{index_cfg.buf});
         std.log.err("unxpected error occur while parsing index: {}", .{e});
         return e;
     };
 
     defer free_index(&index, a);
 
-    
-    
+
+    //
+    // read master locked
     // The file containing the commit of the current installation of the `master` release, if any.
     // When its empty, it means no master is instsalled, or something went terribly wrong.
-    var master_f = try zvm_dir.createFile("master.txt", .{.truncate = false, .read = true});
-    defer master_f.close();
-    const master_locked = try master_f.readToEndAlloc(a, 1024);
-    defer a.free(master_locked);
+    var master_cfg = try FileConfig.init(&zvm_dir, "master.txt", arena);
+    defer master_cfg.commit() catch unreachable;
 
-   
+
     //
     // read the list of installation
     //
-    var list_f = try zvm_dir.createFile("list.txt", .{.truncate = false, .read = true});
-    defer list_f.close();
-    const list_str = try list_f.readToEndAlloc(a, 1024);
-    defer a.free(list_str);
-    var list_map = try read_list(list_str, a);
-    defer list_map.deinit(a);
-
+    var list_cfg = try FileConfigSet.init(&zvm_dir, "list.txt", arena);
+    defer list_cfg.commit() catch unreachable;
 
     //
     // read the current installation in use 
-    var use_f = try zvm_dir.createFile("use.txt", .{.truncate = false, .read = true});
-    defer use_f.close();
-    const use_str = try use_f.readToEndAlloc(a, 1024);
-    defer a.free(use_str);
-    
+    //
+    var use_cfg = try FileConfig.init(&zvm_dir, "use.txt", arena);
+    defer use_cfg.commit() catch unreachable;
 
     //
     // detect the current platform
     //
-    const double_str = try allocPrint(a, "{s}-{s}", .{@tagName(builtin.cpu.arch), @tagName(builtin.target.os.tag)});
-    defer a.free(double_str);
+    const double_str = try allocPrint(arena, "{s}-{s}", .{@tagName(builtin.cpu.arch), @tagName(builtin.target.os.tag)});
     std.log.info("Detected system: {s}", .{double_str});
     // for `install`, this is the release to 
-    
+
 
     // 
     // get mirror and calculate the fastest
     //
-    var mirror_f = try zvm_dir.createFile("mirror.txt", .{.truncate = false, .read = true});
-    const mirror_list = if ((try mirror_f.stat()).size == 0 or opts.mirror.fetch) blk: {
-        const mirror_list = fetch_mirror_list(&client, a) catch |e| {
-            std.log.err("{}: failed to fetch mirror", .{e});
-            return e;
-        };
-        try mirror_f.writeAll(mirror_list);
-        break :blk mirror_list;
-    } else try mirror_f.readToEndAlloc(a, 1024); 
-    defer a.free(mirror_list);
-
+    var mirror_cfg = try FileConfigSet.init(&zvm_dir, "mirror.txt", arena);
+    try mirror_cfg.fetch_if_empty_or_force(official_download ++ "/community-mirrors.txt", &client, opts.mirror.fetch, arena);
 
     // handle different command
     if (mirror_cmd.occur) {
-        var mirror_it = std.mem.tokenizeScalar(u8, mirror_list, '\n');
+        var mirror_it = mirror_cfg.set.iterator();
         while (mirror_it.next()) |mirror| {
-            print("{s}\n", .{mirror});
+            print("{s}\n", .{mirror.key_ptr.*});
         }
         return;
     } else if (list_cmd.occur) {
@@ -466,24 +566,19 @@ pub fn main() !void {
         //         
         //     }
         // }
-        var it = list_map.iterator();
+        var it = list_cfg.set.iterator();
         print("installed zig:\n", .{});
         while (it.next()) |entry| {
             print("{s}\n", .{entry.key_ptr.*});
         }
         return;
     } else if (release_cmd.occur) {
-        if (opts.release.name.len == 0) {
-            var index_it = index.map.iterator();
-            while (index_it.next()) |entry| {
-                print("{s} {s}\n", .{entry.key_ptr.*, entry.value_ptr.version});
-            }
-        } else {
-            const release = index.map.get(opts.release.name) orelse {
-                std.log.err("Unknown release {s}, try with `--fetch`", .{opts.release.name});
+        if (opts.release.name) |release_name| {
+            const release = index.map.get(release_name) orelse {
+                std.log.err("Unknown release {s}, try with `--fetch`", .{release_name});
                 return Error.UnknownRelease;
             };
-            if (std.mem.eql(u8, opts.release.name, "master")) {
+            if (std.mem.eql(u8, release_name, "master")) {
                 print("{s}\n", .{release.version});
             } else {
                 print("{s}\n", .{release.notes});
@@ -494,6 +589,12 @@ pub fn main() !void {
                 const download = platform.value_ptr;
                 print("{s}: {s}\n", .{platform.key_ptr.*, download.tarball});
             }
+        } else {
+            var index_it = index.map.iterator();
+            while (index_it.next()) |entry| {
+                print("{s} {s}\n", .{entry.key_ptr.*, entry.value_ptr.version});
+            }
+
         }
 
         return;
@@ -502,54 +603,44 @@ pub fn main() !void {
         // A symlink would be created targeting the folder named `installed_name`.
         // For `master`, we need to retreive its commit
         const installed_name = try allocPrint(a, "zig-{s}-{s}", 
-            .{double_str, if (is_master) master_locked else opts.install.release});
+            .{double_str, if (is_master) master_cfg.buf else opts.install.release});
         defer a.free(installed_name);
-        list_map.get(installed_name) orelse {
+        if (!list_cfg.get(installed_name)) {
             std.log.err("{s} is not installed", .{installed_name});
             return Error.UnknownRelease;
-        };
-        if (std.mem.eql(u8, use_str, opts.install.release)) {
+        }
+        if (std.mem.eql(u8, use_cfg.buf, opts.install.release)) {
             std.log.info("{s} already in use", .{installed_name});
         }
 
         zvm_dir.deleteFile("zig") catch {};
         try zvm_dir.symLink(installed_name, "zig", .{.is_directory = true});
-        try use_f.seekTo(0);
-        try use_f.setEndPos(0);
-        try use_f.writeAll(opts.install.release);
+        use_cfg.overwrite(opts.install.release);
         return;
     } else if (uninstall_cmd.occur) {
         const installed_name = try allocPrint(a, "zig-{s}-{s}", 
-            .{double_str, if (is_master) master_locked else opts.install.release});
+            .{double_str, if (is_master) master_cfg.buf else opts.install.release});
         defer a.free(installed_name);
-      
-        _ = list_map.get(installed_name) orelse {
+
+        if (!list_cfg.get(installed_name)) {
             std.log.err("{s} is not installed", .{installed_name});
             return Error.UnknownRelease;
-        };
+        }
         if (!ask_for_yes(&stdin, "removing installation {s}", .{installed_name})) return;
         zvm_dir.deleteTree(installed_name) catch |e| {
             std.log.err("{}: failed to delete installation {s}", .{e, installed_name});
             return e;
         };
-        assert(list_map.swapRemove(installed_name));
-        try list_f.seekTo(0);
-        try list_f.setEndPos(0);
-        var list_it = list_map.iterator();
-        while (list_it.next()) |entry| {
-           try list_f.writeAll(entry.key_ptr.*);
-           try list_f.writeAll("\n");
+        assert(list_cfg.set.swapRemove(installed_name));
+
+        if (std.mem.eql(u8, use_cfg.buf, installed_name)) {
+            std.log.info("{s} is no longer in use", .{use_cfg.buf});
+            zvm_dir.deleteFile("zig") catch {};
+            use_cfg.clear();
         }
 
-        if (std.mem.eql(u8, use_str, installed_name)) {
-            std.log.info("{s} is no longer in use", .{use_str});
-            zvm_dir.deleteFile("zig") catch {};
-            try use_f.seekTo(0);
-            try use_f.setEndPos(0); 
-        }
-        
         if (is_master) {
-            try master_f.setEndPos(0);
+            master_cfg.clear();
         }
         return; 
     } else if (install_cmd.occur) {
@@ -559,16 +650,16 @@ pub fn main() !void {
         defer a.free(installed_name);
 
         std.log.debug("installing {s}...", .{installed_name});
-        if (list_map.get(installed_name)) |_| {
+        if (list_cfg.get(installed_name)) {
             std.log.info("{s} is already installed, do `zvm use {s}` to use it", .{installed_name, opts.install.release});
             return;
         }
         // if we are install a master, and there is a master already installed, that this different from the latest master.
-        if (is_master and master_locked.len != 0) {
-            if (std.mem.eql(u8, master_locked, latest_master)) @panic("Something went wrong: the latest master should not have been installed.");
+        if (is_master and master_cfg.buf.len != 0) {
+            if (std.mem.eql(u8, master_cfg.buf, latest_master)) @panic("Something went wrong: the latest master should not have been installed.");
             if (!ask_for_yes(&stdin, 
                     "Trying to installed latest master {s}, but master {s} already installed, do you want to overwiter it?",
-                    .{latest_master, master_locked})) return;
+                    .{latest_master, master_cfg.buf})) return;
         }
 
         const release = index.map.get(opts.install.release) orelse { std.log.err("Unknown release {s}", .{opts.install.release});
@@ -592,7 +683,7 @@ pub fn main() !void {
         const tarball_name = std.fs.path.basename(path);
 
 
-        const fastest = if (opts.install.mirror.len == 0) try cal_fastest_mirror(&client, mirror_list, a) else .{@as(i64, 0), opts.install.mirror};
+        const fastest = if (opts.install.mirror) |mirror| .{@as(i64, 0), mirror} else try cal_fastest_mirror(&client, mirror_cfg, a);
         std.log.debug("{s} has the lowest latency {}ms", .{fastest[1], fastest[0]});
 
         const final_url = try allocPrint(a, "{s}/{s}", .{fastest[1], tarball_name});
@@ -600,35 +691,31 @@ pub fn main() !void {
         std.log.debug("final url {s}", .{final_url});
 
 
-        // TODO: use temporary location
-        const output_path = try std.fs.path.resolve(a, &.{"/tmp", tarball_name});
+        const output_path = try std.fs.path.resolve(a, &.{temp_folder, tarball_name});
         defer a.free(output_path);
         try download_tarball(final_url, output_path, a);
-        verify_tarball(output_path, tarball_name, &client, a) catch |e| {
+        const sig_url = if (!is_master) 
+            try allocPrint(arena, "{s}/{s}/{s}.minisig", .{official_download, opts.install.release, tarball_name})
+        else try allocPrint(arena, "{s}/{s}.minisig", .{official_builds, tarball_name});
+        std.log.debug("signature url: {s}", .{sig_url});
+        verify_tarball(output_path, tarball_name, sig_url, &client, a) catch |e| {
             std.log.err("{} failed to verify signature of {s}", .{e, output_path});
             return Error.SignatureError;
         };
         std.log.info("decompressing...", .{});
         try decompress_tarball(output_path, zvm_path, a);
 
+        {
+            const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{double_str, master_cfg.buf});
+            try zvm_dir.deleteTree(master_locked_installed_name);
+            master_cfg.overwrite(latest_master);
+        }
 
-        try master_f.seekTo(0);
-        try master_f.setEndPos(0);
-        try master_f.writeAll(latest_master);
-
-        const master_locked_installed_name = try allocPrint(a, "zig-{s}-{s}", .{double_str, master_locked});
-        defer a.free(master_locked_installed_name);
-        try zvm_dir.deleteTree(master_locked_installed_name);
-
-        try list_map.putNoClobber(a, opts.install.release, void{});
+        try list_cfg.append_line(installed_name, arena);
         std.log.info("{s} installed! do `zvm use` to use it", .{installed_name});
-        try list_f.writeAll(installed_name);
-        try list_f.writeAll("\n");
-
-
         // const symlink_path = try std.fs.path.resolve(a, &.{zvm_path, "zig"});
         // defer a.free(symlink_path);
-    // std.fs.deleteFileAbsolute(symlink_path) catch {};
-    // try std.fs.symLinkAbsolute(output_path[0..output_path.len-7], symlink_path, .{.is_directory = true});
+        // std.fs.deleteFileAbsolute(symlink_path) catch {};
+        // try std.fs.symLinkAbsolute(output_path[0..output_path.len-7], symlink_path, .{.is_directory = true});
     } else unreachable;
 }

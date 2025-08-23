@@ -33,35 +33,39 @@ pub const ArgParser = struct {
         desc: []const u8,
         occur: bool = false,
 
+        pub fn Maybe(comptime T: type) type {
+            return union(enum) {
+                none,
+                just: *const T,
+            };
+        }
+
         pub fn add_opt(
             self: *Command,
             comptime T: type, ref: *T,
-            default: ?*const T,
+            default: Maybe(T),
             arg_ty: ArgType,
             meta_var_name: []const u8,
             desc: []const u8) *Command {
             const a = self.root.a;
-            const d: ?Default = if (default) |d| Default{.ptr = @ptrCast(d), .size = @sizeOf(T)} else null;
-            const info = @typeInfo(T);
-            const p = switch(info) {
-                .float => Parse {.f = parse_f32, .ptr = @ptrCast(ref), .default = d, .meta_var_name = meta_var_name, .desc = desc},
-                .@"enum" => Parse {.f = gen_parse_enum(T), .ptr = @ptrCast(ref), .default = d, .meta_var_name = meta_var_name, .desc = desc},
-                .bool => Parse {.f = undefined, .ptr = @ptrCast(ref), .default = d, .meta_var_name = meta_var_name, .pure_flag = true, .desc = desc},
-                .int => Parse {.f = gen_parse_int(T), .ptr = @ptrCast(ref), .default = d, .meta_var_name = meta_var_name, .desc = desc},
-                else => 
-                    if (T == []const u8)
-                        Parse {.f = parse_str, .ptr = @ptrCast(ref), .default = d, .meta_var_name = meta_var_name, .desc = desc}
-                    else if (T == [:0]const u8)
-                        Parse {.f = parse_strz, .ptr = @ptrCast(ref), .default = d, .meta_var_name = meta_var_name, .desc = desc}
-                    else
-                        @compileError("Unsupported opt type " ++ @typeName(T)),
-                    };
+            const d: ?Default = switch (default) {
+                .none => null,
+                .just => |val| Default{.ptr = @ptrCast(val), .size = @sizeOf(T)},
+            };
+            const p = Parse {
+                .f = gen_parse(T), 
+                .ptr = @ptrCast(ref),
+                .default = d,
+                .meta_var_name = meta_var_name,
+                .pure_flag = T == bool,
+                .desc = desc
+            };
             switch (arg_ty) {
                 .prefix => |prefix| 
                     if (self.prefix_args.fetchPut(a, prefix, p) catch unreachable) |_| {
                         std.process.fatal("prefix arg `{s} {s}`already exists", .{prefix, p.meta_var_name});
                     },
-                    .positional => self.postional_args.append(a, p) catch unreachable,
+                .positional => self.postional_args.append(a, p) catch unreachable,
             }
             return self;
         }
@@ -204,11 +208,11 @@ pub const ArgParser = struct {
         ptr: *anyopaque,
         occurence: u32 = 0,
         default: ?Default,
-                 meta_var_name: []const u8,
-                 desc: []const u8,
+        meta_var_name: []const u8,
+        desc: []const u8,
 
-                 pure_flag: bool = false,
-             };
+        pure_flag: bool = false,
+    };
 
     const EnumContext = struct {
         fields: []std.builtin.Type.EnumField,
@@ -223,12 +227,38 @@ pub const ArgParser = struct {
         arg_ty: ArgType,
         meta_var_name: []const u8,
         desc: []const u8) *ArgParser {
-        
+
         return self.root_command.add_opt(T, ref, default, arg_ty, meta_var_name, desc);
     }
 
     pub fn sub_command(self: *ArgParser, name: []const u8, desc: []const u8) *Command {
         return self.root_command.sub_command(name, desc);
+    }
+
+    pub fn gen_parse(comptime T: type) *const ParseFn {
+        const info = @typeInfo(T);
+        return switch(info) {
+            .float => parse_f32,
+            .@"enum" => gen_parse_enum(T),
+            .bool => undefined, // never used
+            .int => gen_parse_int(T),
+            .optional => |optional| struct {
+                pub fn f(raw_arg: [:0]const u8, ptr: *anyopaque) bool {
+                    const inner_f = gen_parse(optional.child);
+                    var inner: optional.child = undefined;
+                    if (!inner_f(raw_arg, @ptrCast(&inner))) return false;
+                    @as(*?optional.child, @alignCast(@ptrCast(ptr))).* = inner;
+                    return true;
+                }
+            }.f,
+            else => 
+                if (T == []const u8)
+                    parse_str
+                else if (T == [:0]const u8)
+                    parse_strz
+                else
+                    @compileError("Unsupported opt type " ++ @typeName(T)),
+                };
     }
 
     fn parse_str(raw_arg: [:0]const u8, ptr: *anyopaque) bool {
