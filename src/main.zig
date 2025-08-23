@@ -129,6 +129,10 @@ const Options = struct {
     mirror: struct {
         fetch: bool,
     },
+
+    add: struct {
+        path: []const u8,
+    },
 };
 
 fn free_index(index: *Index, a: Allocator) void {
@@ -389,6 +393,7 @@ const FileConfigSet = struct {
             var it = self.set.iterator();
             while (it.next()) |entry| {
                 try self.file.writeAll(entry.key_ptr.*);
+                try self.file.writeAll("\n");
             }
         }
         self.file.close();
@@ -463,6 +468,11 @@ pub fn main() !void {
         arg_parser.sub_command("use", "use an installation")
         .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the release to use");
 
+    const add_cmd = 
+        arg_parser.sub_command("add", "add a manually donwloaded tarball to the list of installations")
+        .add_opt([]const u8, &opts.add.path, .none, .positional, "<path>", "the path to add");
+
+
     try arg_parser.parse(&args);
     opts.mirror.fetch = opts.mirror.fetch or opts.install.fetch;
     opts.release.fetch = opts.release.fetch or opts.install.fetch;
@@ -502,6 +512,7 @@ pub fn main() !void {
     //
     // fetch or read index from cached
     //
+    std.log.debug("reading index", .{});
     var index_cfg = try FileConfig.init(&zvm_dir, "index.json", arena);
     defer index_cfg.commit() catch unreachable;
     try index_cfg.fetch_if_empty_or_force(official_download ++ "/index.json", &client, opts.release.fetch, arena);
@@ -521,6 +532,7 @@ pub fn main() !void {
     // read master locked
     // The file containing the commit of the current installation of the `master` release, if any.
     // When its empty, it means no master is instsalled, or something went terribly wrong.
+    std.log.debug("reading master", .{});
     var master_cfg = try FileConfig.init(&zvm_dir, "master.txt", arena);
     defer master_cfg.commit() catch unreachable;
 
@@ -528,12 +540,14 @@ pub fn main() !void {
     //
     // read the list of installation
     //
+    std.log.debug("reading list", .{});
     var list_cfg = try FileConfigSet.init(&zvm_dir, "list.txt", arena);
     defer list_cfg.commit() catch unreachable;
 
     //
     // read the current installation in use 
     //
+    std.log.debug("reading use", .{});
     var use_cfg = try FileConfig.init(&zvm_dir, "use.txt", arena);
     defer use_cfg.commit() catch unreachable;
 
@@ -548,7 +562,10 @@ pub fn main() !void {
     // 
     // get mirror and calculate the fastest
     //
+
+    std.log.debug("reading mirror", .{});
     var mirror_cfg = try FileConfigSet.init(&zvm_dir, "mirror.txt", arena);
+    defer mirror_cfg.commit() catch unreachable;
     try mirror_cfg.fetch_if_empty_or_force(official_download ++ "/community-mirrors.txt", &client, opts.mirror.fetch, arena);
 
     // handle different command
@@ -643,6 +660,40 @@ pub fn main() !void {
             master_cfg.clear();
         }
         return; 
+    } else if (add_cmd.occur) {
+        var f = try std.fs.openFileAbsolute(opts.add.path, .{});
+        defer f.close();
+        const basename = std.fs.path.basename(opts.add.path);
+        const kind = (try f.stat()).kind;
+        errdefer std.log.err("<path> ({s}) must be either a tar file or a directory", .{opts.add.path});
+
+        const installed_name = switch (kind) {
+            .file => blk: {
+                const idx = std.mem.lastIndexOf(u8, basename, ".tar") orelse {
+                    return Error.UnknownRelease;
+                };
+                const folder_name = basename[0..idx];
+                if (list_cfg.get(folder_name)) {
+                    std.log.err("{s} already existed as an installation", .{folder_name});
+                    return Error.UnknownRelease;
+                }
+                try decompress_tarball(opts.add.path, zvm_path, a);
+                break :blk folder_name;
+            },
+            .directory => blk: {
+                if (list_cfg.get(basename)) {
+                    std.log.err("{s} already existed as an installation", .{opts.add.path});
+                    return Error.UnknownRelease;
+                }
+                try std.fs.renameAbsolute(opts.add.path, try std.fs.path.resolve(arena, &.{zvm_path, basename}));
+                break :blk basename;
+            },
+            else => {
+                return Error.UnknownRelease;
+            }
+        };
+        list_cfg.append_line(installed_name, arena) catch unreachable;
+        return;
     } else if (install_cmd.occur) {
         const latest_master = index.map.get("master").?.version;
         const installed_name = try allocPrint(a, "zig-{s}-{s}", 
