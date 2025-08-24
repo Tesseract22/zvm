@@ -280,14 +280,13 @@ const FileConfig = struct {
 
     pub fn fetch(self: *FileConfig, url: []const u8, client: *std.http.Client, arena: Allocator) !void {
         var buf: [MAX_FETCH_SIZE]u8 = undefined;
-        var storage = std.ArrayListUnmanaged(u8).initBuffer(&buf);
+        var writer = std.io.Writer.fixed(&buf);
         const resp = try client.fetch(.{
             .location = .{.url = url},
-            .response_storage = .{.static = &storage },
+            .response_writer = &writer,
         });
         if (resp.status != .ok) return Error.NetworkError;
-        std.log.debug("storage: {}", .{storage.items.len});
-        self.overwrite(try arena.dupe(u8, storage.items));
+        self.overwrite(try arena.dupe(u8, writer.buffered()));
         self.dirty = true;
     }
 
@@ -347,7 +346,7 @@ const FileConfigSet = struct {
         self.set.ensureTotalCapacity(arena, count) catch unreachable;
         var lines = std.mem.tokenizeScalar(u8, buf, '\n');
         while (lines.next()) |line| {
-            if (self.set.fetchPut(arena, line, {}) catch unreachable) |_|
+            if (self.set.fetchPut(arena, try arena.dupe(u8, line), {}) catch unreachable) |_|
                 return SetError.DuplicateEntry;
         }
         assert(self.set.count() == count);
@@ -378,13 +377,13 @@ const FileConfigSet = struct {
 
     pub fn fetch(self: *FileConfigSet, url: []const u8, client: *std.http.Client, arena: Allocator) !void {
         var buf: [MAX_FETCH_SIZE]u8 = undefined;
-        var storage = std.ArrayListUnmanaged(u8).initBuffer(&buf);
+        var writer = std.io.Writer.fixed(&buf);
         const resp = try client.fetch(.{
             .location = .{.url = url},
-            .response_storage = .{.static = &storage },
+            .response_writer = &writer,
         });
         if (resp.status != .ok) return Error.NetworkError;
-        try self.overwrite(arena.dupe(u8, storage.items) catch unreachable, arena);
+        try self.overwrite(try arena.dupe(u8, writer.buffered()), arena);
         self.dirty = true;
     }
 
