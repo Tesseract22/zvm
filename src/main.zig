@@ -181,7 +181,7 @@ fn cal_fastest_mirror(client: *std.http.Client, mirror_cfg: FileConfigSet, a: Al
     return fastest;
 }
 
-fn download_tarball(url: []const u8, output_path: []const u8, a: Allocator) !void {
+fn download_wget(url: []const u8, output_path: []const u8, a: Allocator) !void {
     var wget = std.process.Child.init(&.{"wget", url, "-O", output_path}, a);    
 
     const wget_term = try wget.spawnAndWait();
@@ -199,23 +199,10 @@ fn download_tarball(url: []const u8, output_path: []const u8, a: Allocator) !voi
     }
 }
 
-fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, sig_url: []const u8, client: *std.http.Client, a: Allocator) !void {
-    var buf: [1024]u8 = undefined;
-    var storage = std.ArrayListUnmanaged(u8) {.items = &buf, .capacity = buf.len};
-    storage.shrinkRetainingCapacity(0);
-    const resp = try client.fetch(.{
-        .location = .{.url = sig_url},
-        .method = .GET,
-        .response_storage = .{ .static = &storage },
-    });
-    if (resp.status != .ok) return Error.SignatureError;
+fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, sig_url: []const u8, a: Allocator) !void {
     const sig_path = try allocPrint(a, temp_folder ++ "/{s}.minisig", .{tarball_name});
     defer a.free(sig_path);
-    {
-        var sig_f = try std.fs.createFileAbsolute(sig_path, .{.truncate = true});
-        defer sig_f.close();
-        try sig_f.writeAll(storage.items);
-    }
+    try download_wget(sig_url, sig_path, a);
 
     var minisign = std.process.Child.init(&.{"minisign", "-Vm", tarball_path, "-P", public_key, "-x", sig_path}, a);
     minisign.stdin_behavior = .Pipe;
@@ -223,7 +210,6 @@ fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, sig_url: [
         if (e == error.FileNotFound) std.log.err("program `minisign` is not installed or available in $PATH", .{});
         return e;
     };
-    try minisign.stdin.?.writeAll(storage.items);
     switch (try minisign.wait()) {
         .Exited => |exit_code| {
             std.log.info("minisign exited with {}", .{exit_code});
@@ -250,19 +236,6 @@ fn decompress_tarball(tarball_path: []const u8, output_dir: []const u8, a: Alloc
         }
     }
 }
-
-fn fetch_mirror_list(client: *std.http.Client, a: Allocator) ![]u8 {
-    var mirror_list_storage = std.ArrayListUnmanaged(u8) {};
-    defer mirror_list_storage.deinit(a);
-    try mirror_list_storage.ensureTotalCapacity(a, 256);
-    const resp = try client.fetch(.{
-        .location = .{.url = official_download ++ "/community-mirrors.txt"},
-        .response_storage = .{ .static = &mirror_list_storage, },
-    });
-    if (resp.status != .ok) return Error.NetworkError;
-    return mirror_list_storage.toOwnedSlice(a);
-}
-
 
 fn read_list(str: []const u8, a: Allocator) !std.StringArrayHashMapUnmanaged(void) {
     var map = std.StringArrayHashMapUnmanaged(void) {};
@@ -382,7 +355,7 @@ const FileConfigSet = struct {
     }
 
     pub fn append_line(self: *FileConfigSet, buf: []const u8, arena: Allocator) !void {
-        if (self.set.fetchPut(arena, buf, {}) catch unreachable) |_| return SetError.DuplicateEntry;
+        if (self.set.fetchPut(arena, try arena.dupe(u8, buf), {}) catch unreachable) |_| return SetError.DuplicateEntry;
         self.dirty = true;
     }
 
@@ -744,12 +717,12 @@ pub fn main() !void {
 
         const output_path = try std.fs.path.resolve(a, &.{temp_folder, tarball_name});
         defer a.free(output_path);
-        try download_tarball(final_url, output_path, a);
+        try download_wget(final_url, output_path, a);
         const sig_url = if (!is_master) 
             try allocPrint(arena, "{s}/{s}/{s}.minisig", .{official_download, opts.install.release, tarball_name})
         else try allocPrint(arena, "{s}/{s}.minisig", .{official_builds, tarball_name});
         std.log.debug("signature url: {s}", .{sig_url});
-        verify_tarball(output_path, tarball_name, sig_url, &client, a) catch |e| {
+        verify_tarball(output_path, tarball_name, sig_url, a) catch |e| {
             std.log.err("{} failed to verify signature of {s}", .{e, output_path});
             return Error.SignatureError;
         };
