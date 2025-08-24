@@ -1,5 +1,5 @@
 //! Author:      Tesseract22
-//! Version:     v0.1.3
+//! Version:     v0.2.0
 //! Date:        2026-04-26
 //!
 //! Description: Zig Version Manager
@@ -14,16 +14,21 @@
 //!     Add '--validate' option to `list` command
 //!   v0.1.3 - 2026-04-28
 //!     Rework mirror speed test, add `--timeout` options to `install` command
+//!   v0.2.0 - 2026-05-03
+//!     Adpat to windows, use a shim exe instead of symlink to "activate" a installationb
+//!     Use zig library minizign instead of cli tool minisign
 //!
 //! License: MIT
 
 // TODO
-// 1. upgrade to zig 0.16
-// 2. fetch with thread pool?
-// 3. being able to install specific commit
-const VERSION = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 3, .build = @import("build").commit };
+// - fetch with thread pool?
+// - being able to install specific commit
+// - Add command to set env var
+// - per-folder config with .env
+const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 0, .build = @import("build").commit };
 
-const public_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
+const PUBLIC_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
+const pk = minizign.PublicKey.decodeFromBase64(PUBLIC_KEY) catch unreachable;
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -38,9 +43,10 @@ const Io = std.Io;
 const builtin = @import("builtin");
 
 const Cli = @import("cli.zig");
+const minizign = @import("thirdparty/minizign.zig");
 
-const EndpointThroughput = struct { 
-    spd: f32, 
+const EndpointThroughput = struct {
+    spd: f32,
     url: []const u8,
 
     fn throughput_gt(_: void, lhs: EndpointThroughput, rhs: EndpointThroughput) bool {
@@ -50,9 +56,8 @@ const EndpointThroughput = struct {
 
 const Index = json.ArrayHashMap(Release);
 
-const temp_folder = if (builtin.target.os.tag == .windows) "~/AppData/Local/Temp" else "/tmp";
-
 const db = @import("database.zig");
+// const utils = @import("utils.zig");
 
 var http_proxy: ?[]const u8 = null;
 var https_proxy: ?[]const u8 = null;
@@ -145,7 +150,7 @@ const Options = struct {
     install: struct {
         release: []const u8,
         mirror: ?[]const u8,
-        timeout: f32,
+        timeout: i64,
         fetch: bool,
     },
 
@@ -173,24 +178,8 @@ fn free_db(a: Allocator) void {
     db.index.deinit(a);
 }
 
-fn test_fetch_mirror(client: *std.http.Client, url: []const u8, item: *EndpointThroughput) Io.Cancelable!void {
-    const start_t = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    _ = client.fetch(.{
-        .location = .{ .url = url },
-        .keep_alive = false,
-    }) catch |e| {
-        log.err("{} cannot connect to mirror {s}. skipping.", .{ e, url });
-        return Io.Cancelable.Canceled;
-    };
-    const end_t = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    const latency = end_t - start_t;
-
-    item.*[0] = latency;
-    log.debug("mirror: {s} {}ms", .{ url, latency });
-}
-
 // this only test latency for now, not throughput
-fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, arena: Allocator, root: std.Progress.Node) []EndpointThroughput {
+fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, timeout: i64, arena: Allocator, root: std.Progress.Node) []EndpointThroughput {
     const mirrors_node = root.startFmt(db.mirror_file.set.count(), "Testing mirror download speed", .{});
     const throughput_lists = arena.alloc(EndpointThroughput, db.mirror_file.set.count()) catch @panic("OOM");
     var mirror_idx: u32 = 0;
@@ -200,7 +189,7 @@ fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, arena
         const final_url = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ mirror.key_ptr.*, tarball_name }, 0) catch @panic("OOM");
         group.async(io, download_test_spd, .{ client, final_url, 1<<20, &throughput_lists[mirror_idx], mirrors_node });
     }
-    io.sleep(.fromSeconds(5), .awake) catch unreachable;
+    io.sleep(.fromSeconds(timeout), .awake) catch unreachable;
     group.cancel(io);
 
     std.mem.sort(EndpointThroughput, throughput_lists, void{}, EndpointThroughput.throughput_gt);
@@ -217,21 +206,30 @@ fn download_test_spd(
     latency_slot.spd = 0;
     latency_slot.url = url;
 
-    // FIXME: platform compatible
-    latency_slot.spd = download_to_path(client, url, "/dev/null", cancel_size, root) catch 0;
+    var buf: [64]u8 = undefined;
+    var discard = Io.Writer.Discarding.init(&buf);
+    latency_slot.spd = download_to_writer(client, url, &discard.writer, cancel_size, root) catch |e| fallback: {
+        log.warn("cannot test speed from `{s}`: {}", .{ url, e });
+        break :fallback 0;
+    };
     // log.debug("{s}: {} bytes/s", .{ latency_slot.url, latency_slot.spd });
 }
 
-fn download_to_path(client: *std.http.Client, url: []const u8, output_path: []const u8, cancel_size: ?usize, root: std.Progress.Node) !f32 {
-    const max_size = cancel_size orelse std.math.maxInt(usize);
-    log.debug("fetching {s}", .{ url });
-    const node = root.startFmt(max_size/1024, "downloading `{s}`", .{ url });
-    defer node.end();
-
-    const f = try Io.Dir.createFileAbsolute(io, output_path, .{});
+fn download_to_path(client: *std.http.Client, url: []const u8, dest: []const u8, cancel_size: ?usize, root: std.Progress.Node) !f32 {
+    log.debug("fetching {s} into {s}", .{ url, dest });
+    const f = try Io.Dir.createFileAbsolute(io, dest, .{});
     defer f.close(io);
     var write_buf: [1024*8]u8 = undefined;
     var writer = f.writer(io, &write_buf);
+
+    return download_to_writer(client, url, &writer.interface, cancel_size, root);
+}
+
+fn download_to_writer(client: *std.http.Client, url: []const u8, writer: *Io.Writer, cancel_size: ?usize, root: std.Progress.Node) !f32 {
+    const max_size = cancel_size orelse std.math.maxInt(usize);
+    const node = root.startFmt(max_size/1024, "downloading `{s}`", .{ url });
+    defer node.end();
+
 
     // TODO: zig's TCP timeout is not yet implemented
     var req = try client.request(.GET, try std.Uri.parse(url), .{});
@@ -262,12 +260,12 @@ fn download_to_path(client: *std.http.Client, url: []const u8, output_path: []co
     while (offset < max_size) {
         const content = reader.take(64) catch |err| switch (err) {
             error.EndOfStream => {
-                offset += try reader.streamRemaining(&writer.interface);
+                offset += try reader.streamRemaining(writer);
                 break;
         },
             else => |e| return e,
         };
-        try writer.interface.writeAll(content[0..@min(content.len, max_size - offset)]);
+        try writer.writeAll(content[0..@min(content.len, max_size - offset)]);
         node.setCompletedItems(offset/1024);
 
         offset += content.len;
@@ -279,8 +277,11 @@ fn download_to_path(client: *std.http.Client, url: []const u8, output_path: []co
     return spd;
 }
 
-fn verify_tarball(client: *std.http.Client, tarball_path: []const u8, tarball_name: []const u8, sig_url: [:0]const u8, gpa: Allocator, root: std.Progress.Node) !void {
-    const sig_path = try allocPrint(gpa, "{s}/{s}.minisig", .{ temp_folder, tarball_name });
+fn verify_tarball(
+    client: *std.http.Client,
+    tarball_path: []const u8,tarball_name: []const u8,
+    sig_url: [:0]const u8, gpa: Allocator, root: std.Progress.Node) !void {
+    const sig_path = try allocPrint(gpa, "{s}/{s}.minisig", .{ db.temp_folder_path, tarball_name });
     defer gpa.free(sig_path);
     const verify_node = root.startFmt(2, "Verifying {s}", .{ tarball_name });
     defer verify_node.end();
@@ -292,23 +293,12 @@ fn verify_tarball(client: *std.http.Client, tarball_path: []const u8, tarball_na
         }
         return e;
     };
+    const tarball_f = try Io.Dir.openFileAbsolute(io, tarball_path, .{});
+    defer tarball_f.close(io);
 
-    var minisign = std.process.spawn(io, .{
-        .argv = &.{ "minisign", "-Vm", tarball_path, "-P", public_key, "-x", sig_path },
-    }) catch |e| {
-        if (e == error.FileNotFound) log.err("program `minisign` is not installed or available in $PATH", .{});
-        return e;
-    };
-    switch (try minisign.wait(io)) {
-        .exited => |exit_code| {
-            log.info("minisign exited with {}", .{exit_code});
-            if (exit_code != 0) return Error.SignatureError;
-        },
-        else => |other| {
-            log.err("minisign terminated unxpectedly {}", .{other});
-            return Error.SignatureError;
-        },
-    }
+    var sig = try minizign.Signature.fromFile(gpa, sig_path, io);
+    defer sig.deinit();
+    try pk.verifyFile(gpa, io, tarball_f, sig, null);
     verify_node.completeOne();
 }
 
@@ -353,40 +343,71 @@ pub var io: Io = undefined;
 
 pub fn ask_for_yes(comptime fmt: []const u8, args: anytype) bool {
     print(fmt ++ "\n", args);
-    print("y[es], n[o]?\n", .{});
+    print("y[es], n[o]? ", .{});
     var buf: [32]u8 = undefined;
     var reader = stdin.reader(io, &buf);
     var buf2: [32]u8 = undefined;
-    const yes_or_no = reader.interface.takeSentinel('\n') catch |e| {
+    var yes_or_no = reader.interface.takeDelimiterExclusive('\n') catch |e| {
         if (e == error.StreamTooLong) return ask_for_yes(fmt, args);
-        log.err("{}: you mean no? fine.", .{e});
+        std.log.err("{}: you mean no? fine.", .{e});
         return false;
     };
+    // on windows, newlien is \r\n
+    if (yes_or_no.len > 0 and yes_or_no[yes_or_no.len - 1] == '\r')  yes_or_no = yes_or_no[0..yes_or_no.len-1];
     const lower = std.ascii.lowerString(&buf2, yes_or_no);
     if (std.mem.eql(u8, lower, "y") or std.mem.eql(u8, lower, "yes")) return true;
     if (std.mem.eql(u8, lower, "n") or std.mem.eql(u8, lower, "no")) return false;
     return ask_for_yes(fmt, args);
 }
 
+pub fn zig_main() !void {
+}
+
 pub fn main(init: std.process.Init) !void {
     var gpa = init.gpa;
-
+    io = init.io;
+    stdin = std.Io.File.stdin();
     var arena_alloc = std.heap.ArenaAllocator.init(gpa);
     defer arena_alloc.deinit();
     const arena = arena_alloc.allocator();
 
-    io = init.io;
-    stdin = std.Io.File.stdin();
-    const prog_root = std.Progress.start(io, .{});
-    defer prog_root.end();
+    const env = init.environ_map;
+    db.detect_zvm_installation(env, arena);
+
+    var args = init.minimal.args.iterateAllocator(gpa) catch @panic("OOM");
+    defer args.deinit();
+    const prog_path = args.next().?;
+
+    const self_path = try std.process.executablePathAlloc(io, gpa);
+    defer gpa.free(self_path);
+    const self_path_base = std.fs.path.basename(self_path);
+    log.debug("prog: {s} ({s})", .{ prog_path, self_path });
+
+    const is_shim = std.mem.eql(u8, self_path_base, std.fs.path.basename(db.ZIG_PATH));
+    db.init(io, if (!is_shim) self_path else null);
+    if (is_shim) {
+        const installed_name = db.use_file.buf;
+        const zig_path = std.fs.path.resolve(arena, &.{ db.zvm_path, installed_name, "zig" }) catch @panic("OOM");
+
+        var zig_args = std.ArrayList([]const u8).initCapacity(arena, init.minimal.args.vector.len) catch @panic("OOM");
+        zig_args.appendAssumeCapacity(zig_path);
+        while (args.next()) |arg| {
+            zig_args.appendAssumeCapacity(arg);
+        }
+        // init.minimal.args.vector
+        var zig = std.process.spawn(io, .{
+            .argv = zig_args.items,
+        }) catch |e| fatal("cannot spawn `{s}` as shim: {}", .{ zig_path, e });
+        _ = zig.wait(io) catch {};
+        return ;
+    }
 
     //
     // cli
     //
     var opts: Options = undefined;
-    var args = init.minimal.args.iterate();
     var arg_parser = Cli.ArgParser{};
-    arg_parser.init(gpa, args.next().?, std.fmt.comptimePrint("zig package manager {f}", .{VERSION}));
+    arg_parser.init(gpa, prog_path, std.fmt.comptimePrint("zig package manager {f}", .{VERSION}));
     defer arg_parser.deinit();
 
     // `add` command that adds a local folder to the list of installation
@@ -400,7 +421,7 @@ pub fn main(init: std.process.Init) !void {
             .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to download, see `zvm list`")
             .add_opt(?[]const u8, &opts.install.mirror, .{ .just = &null }, .{ .prefix = "--mirror" }, "<mirror>", "the mirror to use")
             .add_opt(bool, &opts.install.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "<seconds>", "fetch the latest db.index and mirrors before install")
-            .add_opt(f32, &opts.install.timeout, .{ .just = &5 }, .{ .prefix = "--timeout" }, "", "the timeout to use for testing speed in mirrors (experimental)");
+            .add_opt(i64, &opts.install.timeout, .{ .just = &5 }, .{ .prefix = "--timeout" }, "", "the timeout to use for testing speed in mirrors (experimental)");
 
     const uninstall_cmd =
         arg_parser.sub_command("uninstall", "uninstall a release")
@@ -435,10 +456,6 @@ pub fn main(init: std.process.Init) !void {
     }
     const is_master = std.mem.eql(u8, opts.install.release, "master");
 
-    var env = init.environ_map;
-
-    db.detect_zvm_installation(env, arena);
-
     if (nuke_cmd.occur) {
         if (ask_for_yes("do you want to delete everything in {s}", .{db.zvm_path})) {
             db.nuke();
@@ -451,7 +468,11 @@ pub fn main(init: std.process.Init) !void {
     var client = std.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    db.init(io, opts.release.fetch, &client);
+    const prog_root = std.Progress.start(io, .{});
+    defer prog_root.end();
+
+
+    db.fetch_if_force_or_empty(&client, opts.release.fetch);
     // TOOD: rollback changes if any error occur
     defer db.deinit() catch |e| fatal("failed to commit changes: {}", .{e});
 
@@ -545,17 +566,14 @@ pub fn main(init: std.process.Init) !void {
         // this is the name of the release the to used.
         // A symlink would be created targeting the folder named `installed_name`.
         // For `master`, we need to retreive its commit
-        const installed_name = try allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.buf else opts.install.release });
-        defer gpa.free(installed_name);
+        const installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.buf else opts.install.release });
         if (!db.installed_file.get(installed_name))
             fatal("{s} is not installed", .{installed_name});
-        if (std.mem.eql(u8, db.use_file.buf, opts.install.release)) {
+        if (std.mem.eql(u8, db.use_file.buf, installed_name)) {
             print("{s} already in use\n", .{installed_name});
         }
 
-        db.zvm_dir.deleteFile(io, "zig") catch {};
-        try db.zvm_dir.symLink(io, installed_name, "zig", .{ .is_directory = true });
-        db.use_file.overwrite(opts.install.release);
+        db.use_file.overwrite(installed_name);
         print("{s} up and running!\n", .{ installed_name });
         return;
     } else if (uninstall_cmd.occur) {
@@ -572,9 +590,10 @@ pub fn main(init: std.process.Init) !void {
         db.installed_file.remove(installed_name);
 
         if (std.mem.eql(u8, db.use_file.buf, installed_name)) {
-            log.info("{s} is no longer in use", .{db.use_file.buf});
-            db.zvm_dir.deleteFile(io, "zig") catch {};
-            db.use_file.clear();
+            @panic("TODO");
+            // log.info("{s} is no longer in use", .{db.use_file.buf});
+            // db.zvm_dir.deleteFile(io, "zig") catch {};
+            // db.use_file.clear();
         }
 
         if (is_master) {
@@ -649,15 +668,18 @@ pub fn main(init: std.process.Init) !void {
 
         const tarball_name = std.fs.path.basename(path);
 
-        const output_path = std.fs.path.resolve(gpa, &.{ temp_folder, tarball_name }) catch @panic("OOM");
+        const output_path = std.fs.path.resolve(gpa, &.{ db.temp_folder_path, tarball_name }) catch @panic("OOM");
         defer gpa.free(output_path);
 
-        const throughput_lists = test_fastest_mirror(&client, tarball_name, arena, install_node);
+        const throughput_list: []const EndpointThroughput = if (opts.install.mirror) |mirror|
+            &.{ EndpointThroughput { .spd = 100 , .url = allocPrint(arena, "{s}/{s}", .{ mirror, tarball_name }) catch @panic("OOM") } }
+        else
+            test_fastest_mirror(&client, tarball_name, opts.install.timeout, arena, install_node);
         // const latencies_sorted: []const Latency = if (opts.install.mirror) |mirror| &.{.{ @as(i64, 0), mirror }} else test_fastest_mirror(&client, gpa);
         // defer if (latencies_sorted.len > 1) gpa.free(latencies_sorted);
         var first_time = true;
 
-        for (throughput_lists) |item| {
+        for (throughput_list) |item| {
             log.info("{s}, speed: {} MB/s", .{ item.url, item.spd/(1<<20) });
             if (item.spd == 0) {
                 log.err("cannot download from `{s}`, skipping.", .{ item.url });
@@ -681,7 +703,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             fatal("no mirror left to proceed, something went terribly wrong", .{});
         }
-        
+
 
         // Verify tarball
         //

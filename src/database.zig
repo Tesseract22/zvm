@@ -1,5 +1,8 @@
 //! Package Database
 //! These are the files used for persistent storage, typically placed in "~/.zvm"
+const IS_WINDOW = @import("builtin").target.os.tag == .windows;
+pub var temp_folder_path: []const u8 = undefined; // $init_on_main
+pub const ENV_HOME = if (IS_WINDOW) "HOMEPATH" else "HOME";
 
 pub const ZVM_STORAGE_PATH = ".zvm";
 /// - INDEX: json of the releases of zig, and its url, etc.
@@ -14,7 +17,7 @@ const MASTER_PATH = "MASTER";
 /// - use: the current activated installation
 const USE_PATH = "USE";
 /// - zig: symbolic link to the zig executable in the activated installation. User would put set PATH to ~/.zvm, and then `zig` should refer to ~/.zvm/zig
-const ZIG_PATH = "zig";
+pub const ZIG_PATH = "bin/" ++ if (IS_WINDOW) "zig.exe" else "zig";
 /// mirror: the list of available mirrors
 const MIRROR_PATH = "MIRROR";
 // - other directories: zig-*: zig installation
@@ -54,8 +57,9 @@ const FileBuffer = struct {
     dirty: bool, // if dirty, commit will overwrite the file.
 
     const MAX_FETCH_SIZE = 1024 * 100;
-    pub fn init(name: []const u8) FileBuffer {
-        const file = zvm_dir.createFile(io, name, .{ .truncate = false, .read = true, .lock = .exclusive }) catch |e| fatal("{}: cannot create file: {s}/{s}", .{ e, ZVM_STORAGE_PATH, name });
+    pub fn init(path: []const u8) FileBuffer {
+        log.debug("opening {s}", .{ path });
+        const file = zvm_dir.createFile(io, path, .{ .truncate = false, .read = true, }) catch |e| fatal("{}: cannot create file: {s}/{s}", .{ e, ZVM_STORAGE_PATH, path });
         var res = FileBuffer{ .file = file, .buf = &.{}, .dirty = true };
         res.refresh();
         return res;
@@ -300,15 +304,20 @@ const main = @import("main.zig");
 
 pub fn detect_zvm_installation(env: *const std.process.Environ.Map, arena_allocator: Allocator) void {
     arena = arena_allocator;
-    const home = env.get("HOME").?;
+    const home = env.get(ENV_HOME).?;
     zvm_path = std.fs.path.resolvePosix(arena, &.{ home, ZVM_STORAGE_PATH }) catch @panic("OOM");
+    temp_folder_path =
+    if (IS_WINDOW)
+        std.fs.path.resolvePosix(arena, &.{ home, "AppData", "Local", "Temp" }) catch @panic("OOM")
+    else
+        "/tmp";
 }
 
 pub fn nuke() void {
     Io.Dir.cwd().deleteTree(io, zvm_path) catch |e| fatal("cannot delete directory {s}: {}", .{ zvm_path, e });
 }
 
-pub fn init(io_: Io, fetch: bool, client: *std.http.Client) void {
+pub fn init(io_: Io, self_path_abs: ?[]const u8) void {
     io = io_;
     zvm_dir = Io.Dir.openDirAbsolute(io, zvm_path, .{ .iterate = true }) catch |e|
         if (e == error.FileNotFound) blk: {
@@ -323,6 +332,13 @@ pub fn init(io_: Io, fetch: bool, client: *std.http.Client) void {
     use_file = .init(USE_PATH);
     mirror_file = .init(MIRROR_PATH);
 
+
+    if (self_path_abs) |self|
+        Io.Dir.cwd().copyFile(self, zvm_dir, ZIG_PATH, io, .{ .make_path = true }) catch |e|
+            fatal("cannot copy `{s}` to `{s}/{s}`: {}", .{ self, zvm_path, ZIG_PATH, e });
+}
+
+pub fn fetch_if_force_or_empty(client: *std.http.Client, fetch: bool) void {
     const fresh_index = if (index_file.fetch_if_empty_or_force(OFFICIAL_DOWNLOAD ++ "/index.json", client, fetch)) true else |e| fallback: {
         std.log.warn("failed to fetch index: {}", .{e});
         break :fallback false;
@@ -349,6 +365,7 @@ pub fn init(io_: Io, fetch: bool, client: *std.http.Client) void {
         }
         mirror_file.refresh();
     };
+
 }
 
 pub fn deinit() !void {
