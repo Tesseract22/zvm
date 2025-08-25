@@ -9,7 +9,9 @@ pub fn build(b: *std.Build) void {
         .optimize = opt,
         .target = target,
         .root_source_file = b.path("src/main.zig"),
+        .link_libc = true,
     });
+    zvm_mod.linkSystemLibrary("curl", .{});
     const zvm = b.addExecutable(.{
         .name = "zvm",
         .root_module = zvm_mod,

@@ -20,6 +20,13 @@ const fatal = std.process.fatal;
 
 const temp_folder = if (builtin.target.os.tag == .windows) "~/AppData/Local/Temp/" else "/tmp/";
 
+const c = @cImport({
+    @cInclude("curl/curl.h");
+});
+
+var http_proxy: ?[]const u8 = null;
+var https_proxy: ?[]const u8 = null;
+
 const Release = struct {
     version: []const u8 = "", // only available when its is a master
     date: []const u8 = "",
@@ -199,10 +206,94 @@ fn download_wget(url: []const u8, output_path: []const u8, a: Allocator) !void {
     }
 }
 
-fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, sig_url: []const u8, a: Allocator) !void {
+const off_t = c.curl_off_t;
+const ProgressState = struct {
+    last_run: off_t = 0,
+    curl: *c.CURL, 
+};
+fn download_progress(p: *anyopaque,
+                    dltotal: off_t, dlnow: off_t,
+                    ultotal: off_t, ulnow: off_t) callconv(.c) c_int {
+    _ = ultotal;
+    _ = ulnow;
+    const MINIMAL_PROGRESS_FUNCTIONALITY_INTERVAL = 3000000;
+    const prog: *ProgressState = @alignCast(@ptrCast(p));
+    const curl = prog.curl; 
+    var curtime: off_t = 0;
+    assert(c.curl_easy_getinfo(curl, c.CURLINFO_TOTAL_TIME, &curtime) == c.CURLE_OK);
+    if((curtime - prog.last_run) >= MINIMAL_PROGRESS_FUNCTIONALITY_INTERVAL) {
+        prog.last_run = curtime;
+        std.debug.print("downloading [", .{});
+        const total_len = 20;
+        const done: usize = if (dltotal != 0) @intCast(@divFloor(total_len * dlnow, dltotal)) else 0;
+        for (0..done) |_| std.debug.print("#", .{});
+        for (0..total_len-done) |_| std.debug.print(".", .{});
+        std.debug.print("] {}/{} bytes\r", .{dlnow, dltotal});
+    }
+
+    return 0;
+}
+
+fn download_curl(url: [:0]const u8, output_path: []const u8, a: Allocator) !void {
+    _ = a;
+    const curl = c.curl_easy_init() orelse {
+        std.log.err("failed to initialize curl handle", .{});
+        return Error.NetworkError;
+    };
+    defer c.curl_easy_cleanup(curl);
+    var prog = ProgressState { .curl = curl };
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_URL, url.ptr);
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_XFERINFOFUNCTION, download_progress);
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_XFERINFODATA, &prog);
+
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_NOPROGRESS, @as(c_int, 0));
+    if (https_proxy orelse http_proxy) |proxy| {
+        std.log.debug("using proxy: {s}", .{proxy});
+        _ = c.curl_easy_setopt(curl, c.CURLOPT_PROXY, proxy.ptr);
+    }
+    const f = try std.fs.createFileAbsolute(output_path, .{});
+    defer f.close();
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_WRITEDATA, &f);
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_WRITEFUNCTION, write_data);
+
+
+    std.log.info("downloading {s}", .{url});
+    const res = c.curl_easy_perform(curl);
+    if (res != c.CURLE_OK) {
+        std.log.err("failed to perform curl to {s}: {}", .{url, res});
+        return Error.NetworkError;
+    }
+    std.debug.print("\n", .{});
+    var response_status: c_int = undefined;
+    _ = c.curl_easy_getinfo(curl, c.CURLINFO_RESPONSE_CODE, &response_status);
+    if (response_status != 200) {
+        std.log.err("fetch content from {s} response with {}", .{url, response_status});
+        if (response_status == 404) {
+            std.log.info("the release exists, but this particular mirror does not have it; try using a different mirror", .{});
+        }
+        return Error.NetworkError;
+    }
+    return;
+
+}
+
+fn write_data(buf: *anyopaque, size: usize, nmemb: usize, userp: *anyopaque) 
+    callconv(.c) usize {
+    std.debug.assert(size == 1);
+    const f: *std.fs.File = @ptrCast(@alignCast(userp));
+    const data: [*]u8 = @alignCast(@ptrCast(buf));
+    f.writeAll(data[0..nmemb]) catch |e| {
+        std.log.err("cannot save download to file: {}", .{e});
+        return 0;
+    };
+    return nmemb;
+
+}
+
+fn verify_tarball(tarball_path: []const u8, tarball_name: []const u8, sig_url: [:0]const u8, a: Allocator) !void {
     const sig_path = try allocPrint(a, temp_folder ++ "/{s}.minisig", .{tarball_name});
     defer a.free(sig_path);
-    try download_wget(sig_url, sig_path, a);
+    try download_curl(sig_url, sig_path, a);
 
     var minisign = std.process.Child.init(&.{"minisign", "-Vm", tarball_path, "-P", public_key, "-x", sig_path}, a);
     minisign.stdin_behavior = .Pipe;
@@ -472,7 +563,7 @@ pub fn main() !void {
             ;
     defer zvm_dir.close();
 
-
+    
     var client = std.http.Client {.allocator = a};
     defer client.deinit();
 
@@ -480,11 +571,12 @@ pub fn main() !void {
     // try client.initDefaultProxies(arena);
     // std.log.info("using proxy from env: {s}:{}", .{client.https_proxy.?.host, client.https_proxy.?.port});
     // assert((try client.fetch(.{.location = .{.url = "http://github.com"}})).status == .ok);
+    http_proxy = env.get("HTTP_PROXY") orelse env.get("http_proxy");
+    https_proxy = env.get("HTTPS_PROXY") orelse env.get("https_proxy");
 
     //
     // fetch or read index from cached
     //
-    std.log.debug("reading index", .{});
     var index_cfg = try FileConfig.init(&zvm_dir, "index.json", arena);
     defer index_cfg.commit() catch unreachable;
     try index_cfg.fetch_if_empty_or_force(official_download ++ "/index.json", &client, opts.release.fetch, arena);
@@ -504,7 +596,6 @@ pub fn main() !void {
     // read master locked
     // The file containing the commit of the current installation of the `master` release, if any.
     // When its empty, it means no master is instsalled, or something went terribly wrong.
-    std.log.debug("reading master", .{});
     var master_cfg = try FileConfig.init(&zvm_dir, "master.txt", arena);
     defer master_cfg.commit() catch unreachable;
 
@@ -512,14 +603,12 @@ pub fn main() !void {
     //
     // read the list of installation
     //
-    std.log.debug("reading list", .{});
     var list_cfg = try FileConfigSet.init(&zvm_dir, "list.txt", arena);
     defer list_cfg.commit() catch unreachable;
 
     //
     // read the current installation in use 
     //
-    std.log.debug("reading use", .{});
     var use_cfg = try FileConfig.init(&zvm_dir, "use.txt", arena);
     defer use_cfg.commit() catch unreachable;
 
@@ -535,7 +624,6 @@ pub fn main() !void {
     // get mirror and calculate the fastest
     //
 
-    std.log.debug("reading mirror", .{});
     var mirror_cfg = try FileConfigSet.init(&zvm_dir, "mirror.txt", arena);
     defer mirror_cfg.commit() catch unreachable;
     try mirror_cfg.fetch_if_empty_or_force(official_download ++ "/community-mirrors.txt", &client, opts.mirror.fetch, arena);
@@ -709,26 +797,26 @@ pub fn main() !void {
         const fastest = if (opts.install.mirror) |mirror| .{@as(i64, 0), mirror} else try cal_fastest_mirror(&client, mirror_cfg, a);
         std.log.debug("{s} has the lowest latency {}ms", .{fastest[1], fastest[0]});
 
-        const final_url = try allocPrint(a, "{s}/{s}", .{fastest[1], tarball_name});
+        const final_url = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{fastest[1], tarball_name}, 0);
         defer a.free(final_url);
-        std.log.debug("final url {s}", .{final_url});
 
 
         const output_path = try std.fs.path.resolve(a, &.{temp_folder, tarball_name});
         defer a.free(output_path);
-        try download_wget(final_url, output_path, a);
+        try download_curl(final_url, output_path, a);
         const sig_url = if (!is_master) 
-            try allocPrint(arena, "{s}/{s}/{s}.minisig", .{official_download, opts.install.release, tarball_name})
-        else try allocPrint(arena, "{s}/{s}.minisig", .{official_builds, tarball_name});
+            try std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{official_download, opts.install.release, tarball_name}, 0)
+        else try std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{official_builds, tarball_name}, 0);
         std.log.debug("signature url: {s}", .{sig_url});
         verify_tarball(output_path, tarball_name, sig_url, a) catch |e| {
             std.log.err("{} failed to verify signature of {s}", .{e, output_path});
             return Error.SignatureError;
         };
+        try std.fs.deleteFileAbsolute(output_path);
         std.log.info("decompressing...", .{});
         try decompress_tarball(output_path, zvm_path, a);
 
-        {
+        if (is_master) {
             const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{double_str, master_cfg.buf});
             try zvm_dir.deleteTree(master_locked_installed_name);
             master_cfg.overwrite(latest_master);
