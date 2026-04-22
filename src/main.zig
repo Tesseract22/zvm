@@ -1,6 +1,17 @@
-const public_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
-const official_download = "https://ziglang.org/download";
-const official_builds = "https://ziglang.org/builds";
+//! Author:      Tesseract22
+//! Version:     v0.1.0
+//! Date:        2026-04-26
+//!
+//! Description: Zig Version Manager
+//!
+//! Changelog:
+//!   v0.1.0 - 2024-01-10 - Initial release
+//!
+//! License: MIT
+//!
+const public_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
+const official_download = "https://ziglang.org/download"; // the url directory for "releases". i.e. 0.15.2
+const official_builds = "https://ziglang.org/builds"; // the url directory for nightly builds
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,7 +48,7 @@ const Release = struct {
     notes: []const u8 = "", // only available when its is not master
 
     platforms: std.StringArrayHashMapUnmanaged(Download) = .empty,
-    
+
     const Token = json.Token;
     pub fn jsonParse(a: Allocator, source: anytype, options: json.ParseOptions) !Release {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
@@ -66,7 +77,7 @@ const Release = struct {
                     break;
                 }
             } else {
-                const download = try json.innerParse(Download, a, source, options);  
+                const download = try json.innerParse(Download, a, source, options);
                 try r.platforms.put(a, field_name, download);
 
             }
@@ -75,13 +86,13 @@ const Release = struct {
     }
 
     pub fn deinit(self: *Release, a: Allocator) void {
-       a.free(self.version); 
-       a.free(self.date); 
-       a.free(self.docs); 
-       a.free(self.stdDocs); 
+       a.free(self.version);
+       a.free(self.date);
+       a.free(self.docs);
+       a.free(self.stdDocs);
        if (self.src) |src| src.deinit(a);
        if (self.bootstrap) |bootstrap| bootstrap.deinit(a);
-       a.free(self.notes); 
+       a.free(self.notes);
        var it = self.platforms.iterator();
        while (it.next()) |kv| {
            a.free(kv.key_ptr.*);
@@ -125,14 +136,14 @@ const Options = struct {
     },
 
     release: struct {
-        fetch: bool, 
+        fetch: bool,
         name: ?[]const u8
     },
 
     list: struct {
         valididate: bool,
     },
-    
+
     mirror: struct {
         fetch: bool,
     },
@@ -189,7 +200,7 @@ fn cal_fastest_mirror(client: *std.http.Client, mirror_cfg: FileConfigSet, a: Al
 }
 
 fn download_wget(url: []const u8, output_path: []const u8, a: Allocator) !void {
-    var wget = std.process.Child.init(&.{"wget", url, "-O", output_path}, a);    
+    var wget = std.process.Child.init(&.{"wget", url, "-O", output_path}, a);
 
     const wget_term = try wget.spawnAndWait();
 
@@ -209,7 +220,7 @@ fn download_wget(url: []const u8, output_path: []const u8, a: Allocator) !void {
 const off_t = c.curl_off_t;
 const ProgressState = struct {
     last_run: off_t = 0,
-    curl: *c.CURL, 
+    curl: *c.CURL,
 };
 fn download_progress(p: *anyopaque,
                     dltotal: off_t, dlnow: off_t,
@@ -218,7 +229,7 @@ fn download_progress(p: *anyopaque,
     _ = ulnow;
     const MINIMAL_PROGRESS_FUNCTIONALITY_INTERVAL = 3000000;
     const prog: *ProgressState = @alignCast(@ptrCast(p));
-    const curl = prog.curl; 
+    const curl = prog.curl;
     var curtime: off_t = 0;
     assert(c.curl_easy_getinfo(curl, c.CURLINFO_TOTAL_TIME, &curtime) == c.CURLE_OK);
     if((curtime - prog.last_run) >= MINIMAL_PROGRESS_FUNCTIONALITY_INTERVAL) {
@@ -235,6 +246,7 @@ fn download_progress(p: *anyopaque,
 }
 
 fn download_curl(url: [:0]const u8, output_path: []const u8, a: Allocator) !void {
+    std.log.debug("curl to {s}", .{ output_path });
     _ = a;
     const curl = c.curl_easy_init() orelse {
         std.log.err("failed to initialize curl handle", .{});
@@ -245,6 +257,7 @@ fn download_curl(url: [:0]const u8, output_path: []const u8, a: Allocator) !void
     _ = c.curl_easy_setopt(curl, c.CURLOPT_URL, url.ptr);
     _ = c.curl_easy_setopt(curl, c.CURLOPT_XFERINFOFUNCTION, download_progress);
     _ = c.curl_easy_setopt(curl, c.CURLOPT_XFERINFODATA, &prog);
+    _ = c.curl_easy_setopt(curl, c.CURLOPT_FOLLOWLOCATION, @as(i32, 1));
 
     _ = c.curl_easy_setopt(curl, c.CURLOPT_NOPROGRESS, @as(c_int, 0));
     if (https_proxy orelse http_proxy) |proxy| {
@@ -277,7 +290,7 @@ fn download_curl(url: [:0]const u8, output_path: []const u8, a: Allocator) !void
 
 }
 
-fn write_data(buf: *anyopaque, size: usize, nmemb: usize, userp: *anyopaque) 
+fn write_data(buf: *anyopaque, size: usize, nmemb: usize, userp: *anyopaque)
     callconv(.c) usize {
     std.debug.assert(size == 1);
     const f: *std.fs.File = @ptrCast(@alignCast(userp));
@@ -352,7 +365,6 @@ fn ask_for_yes(stdin: *std.fs.File, comptime fmt: []const u8, args: anytype) boo
     if (std.mem.eql(u8, lower, "y") or std.mem.eql(u8, lower, "yes")) return true;
     if (std.mem.eql(u8, lower, "n") or std.mem.eql(u8, lower, "no")) return false;
     return ask_for_yes(stdin, fmt, args);
-
 }
 
 const FileConfig = struct {
@@ -419,7 +431,7 @@ const FileConfigSet = struct {
         var buf: [256]u8 = undefined;
         var reader = file.reader(&buf);
         const buf2 = try reader.interface.allocRemaining(arena, .unlimited);
-        var cfg = FileConfigSet {.file = file, .set = .empty, .dirty = false}; 
+        var cfg = FileConfigSet {.file = file, .set = .empty, .dirty = false};
         try cfg.overwrite(buf2, arena);
         return cfg;
     }
@@ -505,33 +517,33 @@ pub fn main() !void {
 
     // TODO: `nuke` command that remove entire installation
     // `add` command that adds a local folder to the list of installation
-    const release_cmd = 
+    const release_cmd =
         arg_parser.sub_command("release", "(fetch and) list the currently avaiable releases")
         .add_opt(bool, &opts.release.fetch, .{.just = &false}, .{.prefix = "--fetch"}, "", "update the index of releases")
         .add_opt(?[]const u8, &opts.release.name, .{.just = &null}, .positional, "<release-name>", "print details for this specific release");
 
-    const install_cmd = 
+    const install_cmd =
         arg_parser.sub_command("install", "install a release")
         .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to download, see `zvm list`")
         .add_opt(?[]const u8, &opts.install.mirror, .{.just = &null}, .{.prefix = "--mirror"}, "<mirror>", "the mirror to use")
         .add_opt(bool, &opts.install.fetch, .{.just = &false}, .{.prefix = "--fetch"}, "", "fetch the latest index and mirrors before install");
 
-    const uninstall_cmd = 
+    const uninstall_cmd =
         arg_parser.sub_command("uninstall", "uninstall a release")
         .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to uninstall, see `zvm list`");
 
-    const mirror_cmd = 
+    const mirror_cmd =
         arg_parser.sub_command("mirror", "fetch and list all the known mirrors")
         .add_opt(bool, &opts.mirror.fetch, .{.just = &false}, .{.prefix = "--fetch"}, "", "update the list of mirror");
 
     const list_cmd = arg_parser.sub_command("list", "list all current installation");
     // list_cmd.add_opt(bool, &opts.list.valididate, &false, .{.prefix = "--valid"}, "validate and fix the current installation", a);
 
-    const use_cmd = 
+    const use_cmd =
         arg_parser.sub_command("use", "use an installation")
         .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the release to use");
 
-    const add_cmd = 
+    const add_cmd =
         arg_parser.sub_command("add", "add a manually donwloaded tarball to the list of installations")
         .add_opt([]const u8, &opts.add.path, .none, .positional, "<path>", "the path to add");
 
@@ -545,7 +557,7 @@ pub fn main() !void {
         return;
     }
     const is_master = std.mem.eql(u8, opts.install.release, "master");
-    // 
+    //
     // create zvm config path if not eixst
     //
 
@@ -554,7 +566,7 @@ pub fn main() !void {
     const home = env.get("HOME").?;
     const zvm_path = try std.fs.path.resolvePosix(a, &.{home, ".zvm"});
     defer a.free(zvm_path);
-    var zvm_dir = std.fs.openDirAbsolute(zvm_path, .{.iterate = true}) catch |e| 
+    var zvm_dir = std.fs.openDirAbsolute(zvm_path, .{.iterate = true}) catch |e|
         if (e == error.FileNotFound) blk: {
             if (!ask_for_yes(&stdin, "creating {s}. You can delete it anytime", .{zvm_path})) return;
             try std.fs.makeDirAbsolute(zvm_path);
@@ -563,7 +575,6 @@ pub fn main() !void {
             ;
     defer zvm_dir.close();
 
-    
     var client = std.http.Client {.allocator = a};
     defer client.deinit();
 
@@ -581,7 +592,7 @@ pub fn main() !void {
     defer index_cfg.commit() catch unreachable;
     try index_cfg.fetch_if_empty_or_force(official_download ++ "/index.json", &client, opts.release.fetch, arena);
 
-    var json_obj = json.Scanner.initCompleteInput(a, index_cfg.buf); 
+    var json_obj = json.Scanner.initCompleteInput(a, index_cfg.buf);
     defer json_obj.deinit();
     var index = Index.jsonParse(a, &json_obj, .{.ignore_unknown_fields = true, .allocate = .alloc_always, .max_value_len = 1024}) catch |e| {
         std.log.debug("index buffer: {s}", .{index_cfg.buf});
@@ -607,7 +618,7 @@ pub fn main() !void {
     defer list_cfg.commit() catch unreachable;
 
     //
-    // read the current installation in use 
+    // read the current installation in use
     //
     var use_cfg = try FileConfig.init(&zvm_dir, "use.txt", arena);
     defer use_cfg.commit() catch unreachable;
@@ -617,10 +628,10 @@ pub fn main() !void {
     //
     const double_str = try allocPrint(arena, "{s}-{s}", .{@tagName(builtin.cpu.arch), @tagName(builtin.target.os.tag)});
     std.log.info("Detected system: {s}", .{double_str});
-    // for `install`, this is the release to 
+    // for `install`, this is the release to
 
 
-    // 
+    //
     // get mirror and calculate the fastest
     //
 
@@ -640,7 +651,6 @@ pub fn main() !void {
         //     var installed_it = zvm.iterate();
         //     while (try installed_it.next()) |entry| {
         //         if (entry.kind != .directory) continue;
-        //         
         //     }
         // }
         var it = list_cfg.set.iterator();
@@ -676,10 +686,10 @@ pub fn main() !void {
 
         return;
     } else if (use_cmd.occur) {
-        // this is the name of the release the to used. 
+        // this is the name of the release the to used.
         // A symlink would be created targeting the folder named `installed_name`.
         // For `master`, we need to retreive its commit
-        const installed_name = try allocPrint(a, "zig-{s}-{s}", 
+        const installed_name = try allocPrint(a, "zig-{s}-{s}",
             .{double_str, if (is_master) master_cfg.buf else opts.install.release});
         defer a.free(installed_name);
         if (!list_cfg.get(installed_name)) {
@@ -695,7 +705,7 @@ pub fn main() !void {
         use_cfg.overwrite(opts.install.release);
         return;
     } else if (uninstall_cmd.occur) {
-        const installed_name = try allocPrint(a, "zig-{s}-{s}", 
+        const installed_name = try allocPrint(a, "zig-{s}-{s}",
             .{double_str, if (is_master) master_cfg.buf else opts.install.release});
         defer a.free(installed_name);
 
@@ -719,7 +729,7 @@ pub fn main() !void {
         if (is_master) {
             master_cfg.clear();
         }
-        return; 
+        return;
     } else if (add_cmd.occur) {
         var f = try std.fs.openFileAbsolute(opts.add.path, .{});
         defer f.close();
@@ -756,7 +766,7 @@ pub fn main() !void {
         return;
     } else if (install_cmd.occur) {
         const latest_master = index.map.get("master").?.version;
-        const installed_name = try allocPrint(a, "zig-{s}-{s}", 
+        const installed_name = try allocPrint(a, "zig-{s}-{s}",
             .{double_str, if (is_master) latest_master else opts.install.release});
         defer a.free(installed_name);
 
@@ -768,7 +778,7 @@ pub fn main() !void {
         // if we are install a master, and there is a master already installed, that this different from the latest master.
         if (is_master and master_cfg.buf.len != 0) {
             if (std.mem.eql(u8, master_cfg.buf, latest_master)) @panic("Something went wrong: the latest master should not have been installed.");
-            if (!ask_for_yes(&stdin, 
+            if (!ask_for_yes(&stdin,
                     "Trying to installed latest master {s}, but master {s} already installed, do you want to overwiter it?",
                     .{latest_master, master_cfg.buf})) return;
         }
@@ -804,7 +814,7 @@ pub fn main() !void {
         const output_path = try std.fs.path.resolve(a, &.{temp_folder, tarball_name});
         defer a.free(output_path);
         try download_curl(final_url, output_path, a);
-        const sig_url = if (!is_master) 
+        const sig_url = if (!is_master)
             try std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{official_download, opts.install.release, tarball_name}, 0)
         else try std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{official_builds, tarball_name}, 0);
         std.log.debug("signature url: {s}", .{sig_url});
@@ -812,9 +822,9 @@ pub fn main() !void {
             std.log.err("{} failed to verify signature of {s}", .{e, output_path});
             return Error.SignatureError;
         };
-        try std.fs.deleteFileAbsolute(output_path);
         std.log.info("decompressing...", .{});
         try decompress_tarball(output_path, zvm_path, a);
+        try std.fs.deleteFileAbsolute(output_path);
 
         if (is_master) {
             const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{double_str, master_cfg.buf});
