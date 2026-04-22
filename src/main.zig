@@ -5,7 +5,7 @@
 //! Description: Zig Version Manager
 //!
 //! Changelog:
-//!   v0.1.0 - 2024-01-10 - Initial release
+//!   v0.1.0 - 2026-04-26 - Initial release
 //!
 //! License: MIT
 //!
