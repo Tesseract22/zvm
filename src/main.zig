@@ -11,6 +11,7 @@
 //!     Added `nuke` command
 //!   v0.1.2 - 2026-04-28
 //!     Upgrade to zig 0.16.0, use io.async to speed to mirror speed test
+//!     Add '--validate' option to `list` command
 //!
 //! License: MIT
 
@@ -431,7 +432,8 @@ pub fn main(init: std.process.Init) !void {
         arg_parser.sub_command("mirror", "fetch and list all the known mirrors")
             .add_opt(bool, &opts.mirror.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "update the list of mirror");
 
-    const list_cmd = arg_parser.sub_command("list", "list all current installation");
+    const list_cmd = arg_parser.sub_command("list", "list all current installation")
+        .add_opt(bool, &opts.list.valididate, .{ .just = &false }, .{ .prefix = "--validate" }, "", "tries to verify the list of installation");
     // list_cmd.add_opt(bool, &opts.list.valididate, &false, .{.prefix = "--valid"}, "validate and fix the current installation", a);
 
     const use_cmd =
@@ -498,12 +500,42 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     } else if (list_cmd.occur) {
-        // if (opts.list.valididate) {
-        //     var installed_it = zvm.iterate();
-        //     while (try installed_it.next()) |entry| {
-        //         if (entry.kind != .directory) continue;
-        //     }
-        // }
+        if (opts.list.valididate) {
+            print("Valiating zig instsallation...\n", .{});
+            var real_installed = std.StringArrayHashMapUnmanaged(void).empty;
+            defer real_installed.deinit(gpa);
+            var should_overwrite = false;
+
+            var installed_it = db.zvm_dir.iterate();
+            while (try installed_it.next(io)) |entry| {
+                if (entry.kind != .directory) continue;
+                if (db.installed_file.set.get(entry.name) == null) {
+                    log.err("direcotry `{s}` does not exist in the list of installation", .{ entry.name });
+                    if (ask_for_yes("Do you want to add `{s}` to the list of installation", .{ entry.name })) {
+                        should_overwrite = true;
+                        real_installed.putNoClobber(gpa, entry.name, {}) catch @panic("OOM");
+                    }
+                } else {
+                    real_installed.putNoClobber(gpa, entry.name, {}) catch @panic("OOM");
+                }
+            }
+
+            var it = db.installed_file.set.iterator();
+            while (it.next()) |item| {
+                if (real_installed.get(item.key_ptr.*) == null) {
+                    log.err("entry `{s}` does not actually exist, deleting it from the list of installations", .{ item.key_ptr.* });
+                    should_overwrite = true;
+                }
+            }
+
+            if (should_overwrite) {
+                db.installed_file.overwrite_set(real_installed);
+                print("Overwriting existing list, new list:\n", .{});
+            } else {
+                print("Everything seems fine.\n", .{});
+            }
+            print("\n", .{});
+        }
         var it = db.installed_file.set.iterator();
         print("installed zig: {}\n", .{db.installed_file.set.count()});
         while (it.next()) |entry| {

@@ -161,6 +161,12 @@ pub const FileBufferSet = struct {
         self.dirty = true;
     }
 
+    pub fn overwrite_set(self: *FileBufferSet, new: std.StringArrayHashMapUnmanaged(void)) void {
+        self.set.deinit(arena);
+        self.set = new.clone(arena) catch @panic("OOM");
+        self.dirty = true;
+    }
+
     pub fn append_line(self: *FileBufferSet, buf: []const u8) !void {
         if (self.set.fetchPut(arena, try arena.dupe(u8, buf), {}) catch unreachable) |_| return SetError.DuplicateEntry;
         self.dirty = true;
