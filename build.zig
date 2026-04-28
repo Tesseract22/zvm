@@ -2,20 +2,23 @@ const std = @import("std");
 const fatal = std.process.fatal;
 
 pub fn get_git_commit(b: *std.Build) []const u8 {
-    var run_git = std.process.Child.init(&.{"git", "rev-parse", "HEAD"}, b.allocator);
-    run_git.stdout_behavior = .Pipe;
-    run_git.spawn() catch fatal("cannot spawn command `git`", .{});
-    const git_commit = run_git.stdout.?.readToEndAlloc(b.allocator, 1024) catch unreachable;
-    switch (run_git.wait() catch unreachable) {
-        .Exited => |code| if (code != 0) fatal("command `git` returns non-zero exit code: {}", .{ code }),
-        else => |any| fatal("command `git` terminated unexpectedly: {}", .{ any }),
+    const io = b.graph.io;
+    var run_git = std.process.spawn(io, .{
+        .argv = &.{ "git", "rev-parse", "HEAD" },
+        .stdout = .pipe,
+    }) catch |e| fatal("cannot spawn git: {}", .{ e });
+    var buf: [64]u8 = undefined;
+    var reader = run_git.stdout.?.reader(io, &buf);
+    const git_commit = reader.interface.allocRemaining(b.allocator, .unlimited) catch unreachable;
+    switch (run_git.wait(io) catch unreachable) {
+        .exited => |code| if (code != 0) fatal("command `git` returns non-zero exit code: {}", .{code}),
+        else => |any| fatal("command `git` terminated unexpectedly: {}", .{any}),
     }
-    
+
     return git_commit;
 }
 
 pub fn build(b: *std.Build) void {
-
     const target = b.resolveTargetQuery(.{});
     const opt = b.standardOptimizeOption(.{});
 
@@ -23,7 +26,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     const git_commit = get_git_commit(b);
     options.addOption([]const u8, "commit", git_commit);
-    
+
     const zvm_mod = b.addModule("zvm", .{
         .optimize = opt,
         .target = target,
