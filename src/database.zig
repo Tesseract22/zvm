@@ -281,8 +281,8 @@ const Release = struct {
 
 const Index = json.ArrayHashMap(Release);
 
-const OFFICIAL_DOWNLOAD = "https://ziglang.org/download"; // the url directory for "releases". i.e. 0.15.2
-const OFFICIAL_BUILDS = "https://ziglang.org/builds"; // the url directory for nightly builds
+pub const OFFICIAL_DOWNLOAD = "https://ziglang.org/download"; // the url directory for "releases". i.e. 0.15.2
+pub const OFFICIAL_BUILDS = "https://ziglang.org/builds"; // the url directory for nightly builds
 
 pub var index_file: FileBuffer = undefined; // $init_on_main
 pub var index: Index = undefined; // $init_on_main

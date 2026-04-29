@@ -34,7 +34,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     zvm_mod.addOptions("build", options);
-    zvm_mod.linkSystemLibrary("curl", .{});
     const zvm = b.addExecutable(.{
         .name = "zvm",
         .root_module = zvm_mod,
