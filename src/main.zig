@@ -1,5 +1,5 @@
 //! Author:      Tesseract22
-//! Version:     v0.1.2
+//! Version:     v0.1.3
 //! Date:        2026-04-26
 //!
 //! Description: Zig Version Manager
@@ -12,6 +12,8 @@
 //!   v0.1.2 - 2026-04-28
 //!     Upgrade to zig 0.16.0, use io.async to speed to mirror speed test
 //!     Add '--validate' option to `list` command
+//!   v0.1.3 - 2026-04-28
+//!     Rework mirror speed test, add `--timeout` options to `install` command
 //!
 //! License: MIT
 
@@ -19,7 +21,7 @@
 // 1. upgrade to zig 0.16
 // 2. fetch with thread pool?
 // 3. being able to install specific commit
-const VERSION = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 2, .build = @import("build").commit };
+const VERSION = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 3, .build = @import("build").commit };
 
 const public_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
 
@@ -37,7 +39,14 @@ const builtin = @import("builtin");
 
 const Cli = @import("cli.zig");
 
-const Latency = struct { i64, []const u8 };
+const EndpointThroughput = struct { 
+    spd: f32, 
+    url: []const u8,
+
+    fn throughput_gt(_: void, lhs: EndpointThroughput, rhs: EndpointThroughput) bool {
+        return lhs.spd > rhs.spd;
+    }
+};
 
 const Index = json.ArrayHashMap(Release);
 
@@ -124,9 +133,6 @@ const Download = struct {
         a.free(self.size);
     }
 };
-fn latency_less_than(_: void, lhs: Latency, rhs: Latency) bool {
-    return lhs[0] < rhs[0];
-}
 
 const Error = error{
     DecompressionError,
@@ -139,6 +145,7 @@ const Options = struct {
     install: struct {
         release: []const u8,
         mirror: ?[]const u8,
+        timeout: f32,
         fetch: bool,
     },
 
@@ -166,7 +173,7 @@ fn free_db(a: Allocator) void {
     db.index.deinit(a);
 }
 
-fn test_fetch_mirror(client: *std.http.Client, url: []const u8, item: *Latency) Io.Cancelable!void {
+fn test_fetch_mirror(client: *std.http.Client, url: []const u8, item: *EndpointThroughput) Io.Cancelable!void {
     const start_t = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     _ = client.fetch(.{
         .location = .{ .url = url },
@@ -183,43 +190,57 @@ fn test_fetch_mirror(client: *std.http.Client, url: []const u8, item: *Latency) 
 }
 
 // this only test latency for now, not throughput
-fn test_fastest_mirror(client: *std.http.Client, a: Allocator) []Latency {
-    var mirror_it = db.mirror_file.set.iterator();
-    const latencies = a.alloc(Latency, mirror_it.len + 1) catch @panic("OOM");
-
+fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, arena: Allocator, root: std.Progress.Node) []EndpointThroughput {
+    const mirrors_node = root.startFmt(db.mirror_file.set.count(), "Testing mirror download speed", .{});
+    const throughput_lists = arena.alloc(EndpointThroughput, db.mirror_file.set.count()) catch @panic("OOM");
+    var mirror_idx: u32 = 0;
+    var it = db.mirror_file.set.iterator();
     var group = Io.Group.init;
-    defer group.cancel(io);
-
-    var idx: u32 = 0;
-    while (mirror_it.next()) |mirror|: (idx += 1) {
-        const url = mirror.key_ptr.*;
-        const item = &latencies[idx];
-        item[0] = std.math.maxInt(i64);
-        item[1] = url;
-        group.async(io, test_fetch_mirror, .{ client, url, item });
+    while (it.next()) |mirror|: (mirror_idx += 1) {
+        const final_url = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ mirror.key_ptr.*, tarball_name }, 0) catch @panic("OOM");
+        group.async(io, download_test_spd, .{ client, final_url, 1<<20, &throughput_lists[mirror_idx], mirrors_node });
     }
-    const item = &latencies[idx];
-    group.async(io, test_fetch_mirror, .{ client, db.OFFICIAL_BUILDS, item });
+    io.sleep(.fromSeconds(5), .awake) catch unreachable;
+    group.cancel(io);
 
-    std.mem.sort(Latency, latencies, void{}, latency_less_than);
-    return latencies;
+    std.mem.sort(EndpointThroughput, throughput_lists, void{}, EndpointThroughput.throughput_gt);
+    mirrors_node.end();
+
+    return throughput_lists;
 }
 
-fn download_to_path(client: *std.http.Client, url: [:0]const u8, output_path: []const u8, root: std.Progress.Node) !void {
-    log.debug("zig http client to {s}", .{output_path});
-    const node = root.startFmt(0, "downloading `{s}`", .{ url });
+fn download_test_spd(
+    client: *std.http.Client, url: [:0]const u8,
+    cancel_size: ?usize, latency_slot: *EndpointThroughput,
+    root: std.Progress.Node) Io.Cancelable!void {
+
+    latency_slot.spd = 0;
+    latency_slot.url = url;
+
+    // FIXME: platform compatible
+    latency_slot.spd = download_to_path(client, url, "/dev/null", cancel_size, root) catch 0;
+    // log.debug("{s}: {} bytes/s", .{ latency_slot.url, latency_slot.spd });
+}
+
+fn download_to_path(client: *std.http.Client, url: []const u8, output_path: []const u8, cancel_size: ?usize, root: std.Progress.Node) !f32 {
+    const max_size = cancel_size orelse std.math.maxInt(usize);
+    log.debug("fetching {s}", .{ url });
+    const node = root.startFmt(max_size/1024, "downloading `{s}`", .{ url });
+    defer node.end();
 
     const f = try Io.Dir.createFileAbsolute(io, output_path, .{});
     defer f.close(io);
     var write_buf: [1024*8]u8 = undefined;
     var writer = f.writer(io, &write_buf);
 
-    var req = try client.request(.GET, try std.Uri.parse(url), .{
-    });
+    // TODO: zig's TCP timeout is not yet implemented
+    var req = try client.request(.GET, try std.Uri.parse(url), .{});
     defer req.deinit();
     try req.sendBodiless();
     var redirect_buf: [8*1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status == .not_found) return Error.NotFoundError;
+    if (response.head.status != .ok) return Error.GeneralNetworkError;
 
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
@@ -227,31 +248,35 @@ fn download_to_path(client: *std.http.Client, url: [:0]const u8, output_path: []
         .deflate, .gzip => client.allocator.alloc(u8, std.compress.flate.max_window_len) catch @panic("OOM"),
         .compress => return error.UnsupportedCompressionMethod,
     };
+    defer client.allocator.free(decompress_buffer);
 
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
-    const length_KB = (response.head.content_length orelse 0)/1024;
-    node.setEstimatedTotalItems(length_KB);
+    const length = (response.head.content_length orelse max_size);
+    node.setEstimatedTotalItems(@min(length, max_size)/1024);
 
+    const start_t = std.Io.Timestamp.now(io, .awake).toMicroseconds();
     var offset: usize = 0;
-    while (true) {
+    while (offset < max_size) {
         const content = reader.take(64) catch |err| switch (err) {
-            error.EndOfStream => break,
+            error.EndOfStream => {
+                offset += try reader.streamRemaining(&writer.interface);
+                break;
+        },
             else => |e| return e,
         };
-        offset += content.len;
-        try writer.interface.writeAll(content);
-
+        try writer.interface.writeAll(content[0..@min(content.len, max_size - offset)]);
         node.setCompletedItems(offset/1024);
-    }
-    _ = try reader.streamRemaining(&writer.interface);
-    try writer.flush();
-    node.end();
 
-    if (response.head.status == .not_found) return Error.NotFoundError;
-    if (response.head.status != .ok) return Error.GeneralNetworkError;
+        offset += content.len;
+    }
+    try writer.flush();
+    const end_t = std.Io.Timestamp.now(io, .awake).toMicroseconds();
+
+    const spd = @as(f32, @floatFromInt(offset))/@as(f32, @floatFromInt(end_t - start_t)) * std.time.us_per_s;
+    return spd;
 }
 
 fn verify_tarball(client: *std.http.Client, tarball_path: []const u8, tarball_name: []const u8, sig_url: [:0]const u8, gpa: Allocator, root: std.Progress.Node) !void {
@@ -259,7 +284,7 @@ fn verify_tarball(client: *std.http.Client, tarball_path: []const u8, tarball_na
     defer gpa.free(sig_path);
     const verify_node = root.startFmt(2, "Verifying {s}", .{ tarball_name });
     defer verify_node.end();
-    download_to_path(client, sig_url, sig_path, verify_node) catch |e| {
+    _ = download_to_path(client, sig_url, sig_path, null, verify_node) catch |e| {
         switch (e) {
             Error.NotFoundError =>
                 log.err("the signature file does not exist at `{s}`, probably because you are downloading a non-release build that is not the latest, try rerun with `--fetch`", .{ sig_url }),
@@ -374,7 +399,8 @@ pub fn main(init: std.process.Init) !void {
         arg_parser.sub_command("install", "install a release")
             .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to download, see `zvm list`")
             .add_opt(?[]const u8, &opts.install.mirror, .{ .just = &null }, .{ .prefix = "--mirror" }, "<mirror>", "the mirror to use")
-            .add_opt(bool, &opts.install.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "fetch the latest db.index and mirrors before install");
+            .add_opt(bool, &opts.install.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "<seconds>", "fetch the latest db.index and mirrors before install")
+            .add_opt(f32, &opts.install.timeout, .{ .just = &5 }, .{ .prefix = "--timeout" }, "", "the timeout to use for testing speed in mirrors (experimental)");
 
     const uninstall_cmd =
         arg_parser.sub_command("uninstall", "uninstall a release")
@@ -588,10 +614,10 @@ pub fn main(init: std.process.Init) !void {
         const installed_name = try allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) latest_master else opts.install.release });
         defer gpa.free(installed_name);
 
-        const install_node = prog_root.startFmt(3, "Installing {s}", .{ installed_name }); 
+        const install_node = prog_root.startFmt(4, "Installing {s}", .{ installed_name });
         defer install_node.end();
         if (db.installed_file.get(installed_name)) {
-            log.info("{s} is already installed, do `zvm use {s}` to use it", .{ installed_name, opts.install.release });
+            print("{s} is already installed, do `zvm use {s}` to use it\n", .{ installed_name, opts.install.release });
             return;
         }
         // if we are install a master, and there is a master already installed, that this different from the latest master.
@@ -607,74 +633,81 @@ pub fn main(init: std.process.Init) !void {
         };
         const download = release.platforms.get(double_str) orelse
             fatal("No {s} found for {s}, run `zvm release {s}` to see the available platform.", .{ double_str, double_str, opts.install.release });
+        const tarball_size = std.fmt.parseInt(usize, download.size, 10) catch unreachable;
 
-        print("tarball: {s}, size: {s}\n", .{download.tarball, download.size});
+        print("tarball: {s}, size: {}\n", .{download.tarball, tarball_size});
 
         // get the last component of tarball, i.e. the name of the tarball
-        const tarball_uri = try std.Uri.parse(download.tarball);
-        var alloc_writer = Io.Writer.Allocating.init(gpa);
-        defer alloc_writer.deinit();
-        try tarball_uri.path.formatPath(&alloc_writer.writer);
-        const path = try alloc_writer.toOwnedSlice();
+        const path = blk: {
+            const tarball_uri = try std.Uri.parse(download.tarball);
+            var alloc_writer = Io.Writer.Allocating.init(gpa);
+            defer alloc_writer.deinit();
+            try tarball_uri.path.formatPath(&alloc_writer.writer);
+            break :blk try alloc_writer.toOwnedSlice();
+        };
         defer gpa.free(path);
 
         const tarball_name = std.fs.path.basename(path);
 
-        const latencies_sorted: []const Latency = if (opts.install.mirror) |mirror| &.{.{ @as(i64, 0), mirror }} else test_fastest_mirror(&client, gpa);
-        defer if (latencies_sorted.len > 1) gpa.free(latencies_sorted);
+        const output_path = std.fs.path.resolve(gpa, &.{ temp_folder, tarball_name }) catch @panic("OOM");
+        defer gpa.free(output_path);
+
+        const throughput_lists = test_fastest_mirror(&client, tarball_name, arena, install_node);
+        // const latencies_sorted: []const Latency = if (opts.install.mirror) |mirror| &.{.{ @as(i64, 0), mirror }} else test_fastest_mirror(&client, gpa);
+        // defer if (latencies_sorted.len > 1) gpa.free(latencies_sorted);
         var first_time = true;
 
-        for (latencies_sorted) |latency_item| {
-            log.debug("{s} has latency {}ms", .{ latency_item[1], latency_item[0] });
+        for (throughput_lists) |item| {
+            log.info("{s}, speed: {} MB/s", .{ item.url, item.spd/(1<<20) });
+            if (item.spd == 0) {
+                log.err("cannot download from `{s}`, skipping.", .{ item.url });
+                continue;
+            }
             if (!first_time and !ask_for_yes("do you want to proceed with next mirror", .{})) { // skip?
                 return;
             }
             first_time = false;
-            const final_url = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ latency_item[1], tarball_name }, 0) catch @panic("OOM");
-            defer gpa.free(final_url);
-
             //
             // Download zig
             //
-            const output_path = std.fs.path.resolve(gpa, &.{ temp_folder, tarball_name }) catch @panic("OOM");
-            defer gpa.free(output_path);
-            download_to_path(&client, final_url, output_path, install_node) catch |e| {
+            _ = download_to_path(&client, item.url, output_path, null, install_node) catch |e| {
                 switch (e) {
                     Error.NotFoundError => log.err("this specific mirror does not have this release", .{}),
-                    else => log.err("cannot fetch `{s}`: {}", .{ final_url, e }),
+                    else => log.err("cannot fetch `{s}`: {}", .{ item.url, e }),
                 }
                 continue;
             };
-
-            //
-            // Verify tarball
-            //
-            const sig_url = if (!is_master)
-                std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, opts.install.release, tarball_name }, 0) catch @panic("OOM")
-            else
-                std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, tarball_name }, 0) catch @panic("OOM");
-            log.debug("signature url: {s}", .{sig_url});
-                        verify_tarball(&client, output_path, tarball_name, sig_url, gpa, install_node) catch |e|
-                fatal("{} failed to verify signature of {s}, potentially dangerous source", .{ e, output_path });
-
-            //
-            // Decompress tarball
-            //
-            try decompress_tarball(output_path, db.zvm_path, install_node);
-            install_node.completeOne();
-            try Io.Dir.deleteFileAbsolute(io, output_path);
-
-            if (is_master) {
-                const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, db.master_file.buf });
-                try db.zvm_dir.deleteTree(io, master_locked_installed_name);
-                db.master_file.overwrite(latest_master);
-            }
-
-            try db.installed_file.append_line(installed_name);
             break;
         } else {
             fatal("no mirror left to proceed, something went terribly wrong", .{});
         }
+        
+
+        // Verify tarball
+        //
+        const sig_url = if (!is_master)
+            std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, opts.install.release, tarball_name }, 0) catch @panic("OOM")
+        else
+            std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, tarball_name }, 0) catch @panic("OOM");
+        log.debug("signature url: {s}", .{sig_url});
+        verify_tarball(&client, output_path, tarball_name, sig_url, gpa, install_node) catch |e|
+            fatal("{} failed to verify signature of {s}, potentially dangerous source", .{ e, output_path });
+
+        //
+        // Decompress tarball
+        //
+        try decompress_tarball(output_path, db.zvm_path, install_node);
+        install_node.completeOne();
+        try Io.Dir.deleteFileAbsolute(io, output_path);
+
+        if (is_master) {
+            const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, db.master_file.buf });
+            try db.zvm_dir.deleteTree(io, master_locked_installed_name);
+            db.master_file.overwrite(latest_master);
+        }
+
+        try db.installed_file.append_line(installed_name);
+
         print("{s} installed! run `zvm use` to use it", .{installed_name});
     } else unreachable;
 }
