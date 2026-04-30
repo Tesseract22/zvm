@@ -285,7 +285,10 @@ pub const ArgParser = struct {
     }
 
     pub fn parse(self: *ArgParser, args: *std.process.Args.Iterator) !void {
-        return self.root_command.parse(args);
+        self.root_command.parse(args) catch |e| {
+            self.print_help();
+            return e;
+        };
     }
 
     pub fn deinit(self: *ArgParser) void {

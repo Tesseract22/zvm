@@ -20,7 +20,8 @@ const USE_PATH = "USE";
 pub const ZIG_PATH = "bin/" ++ if (IS_WINDOW) "zig.exe" else "zig";
 /// mirror: the list of available mirrors
 const MIRROR_PATH = "MIRROR";
-// - other directories: zig-*: zig installation
+/// - installation/: zig-* goes in here
+pub const INSTALLATION_PATH = "installaiton/";
 
 const std = @import("std");
 const json = std.json;
@@ -51,174 +52,120 @@ const Error = error{
     NetworkError,
 };
 
-const FileBuffer = struct {
-    file: Io.File,
-    buf: []const u8,
-    dirty: bool, // if dirty, commit will overwrite the file.
+pub fn FileBuffer(comptime T: type) type {
+    return struct {
+        file: Io.File,
+        data: T,
 
-    const MAX_FETCH_SIZE = 1024 * 100;
-    pub fn init(path: []const u8) FileBuffer {
-        log.debug("opening {s}", .{ path });
-        const file = zvm_dir.createFile(io, path, .{ .truncate = false, .read = true, }) catch |e| fatal("{}: cannot create file: {s}/{s}", .{ e, ZVM_STORAGE_PATH, path });
-        var res = FileBuffer{ .file = file, .buf = &.{}, .dirty = true };
-        res.refresh();
-        return res;
-    }
-
-    pub fn fetch(self: *FileBuffer, url: []const u8, client: *std.http.Client) !void {
-        log.info("fetching: {s}", .{url});
-        var buf: [MAX_FETCH_SIZE]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buf);
-        const resp = try client.fetch(.{
-            .location = .{ .url = url },
-            .response_writer = &writer,
-        });
-        if (resp.status != .ok) return Error.NetworkError;
-        self.overwrite(try arena.dupe(u8, writer.buffered()));
-        self.dirty = true;
-    }
-
-    pub fn fetch_if_empty_or_force(self: *FileBuffer, url: []const u8, client: *std.http.Client, force_fetch: bool) !void {
-        if (force_fetch or self.buf.len == 0) return self.fetch(url, client);
-    }
-
-    pub fn commit(self: *FileBuffer) !void {
-        if (self.dirty) {
-            var buf: [256]u8 = undefined;
-            var writer = self.file.writer(io, &buf);
-            try writer.seekTo(0);
-            try self.file.setLength(io, 0);
-            try writer.interface.writeAll(self.buf);
-            try writer.flush();
+        const Self = @This();
+        const MAX_FETCH_SIZE = 1024 * 100;
+        pub fn init(name: []const u8) Self {
+            const file = zvm_dir.createFile(io, name, .{ .truncate = false, .read = true, .lock = .exclusive })
+                catch |e| fatal("{}: cannot create file: {s}/{s}", .{ e, ZVM_STORAGE_PATH, name });
+            const data: T = switch (T) {
+                []const u8 => &.{},
+                std.StringArrayHashMapUnmanaged(void) => .empty,
+                else => unreachable,
+            };
+            var res = Self{ .file = file, .data = data };
+            res.refresh();
+            return res;
         }
-        self.file.close(io);
-    }
 
-    pub fn clear(self: *FileBuffer) void {
-        self.buf = &.{};
-        self.dirty = true;
-    }
-
-    pub fn refresh(self: *FileBuffer) void {
-        if (self.dirty) {
-            var buf: [256]u8 = undefined;
-            var reader = self.file.reader(io, &buf);
-            const content = reader.interface.allocRemaining(arena, .unlimited) catch @panic("OOM");
-            self.buf = content;
-            self.dirty = false;
+        pub fn init_to(name: []const u8, to: *Self) void {
+            to.* = Self.init(name);
         }
-    }
 
-    pub fn overwrite(self: *FileBuffer, new: []const u8) void {
-        self.buf = new;
-        self.dirty = true;
-    }
-};
+        pub fn fetch(self: *Self, url: []const u8, client: *std.http.Client) !void {
+            log.info("fetching: {s}", .{url});
+            var buf: [MAX_FETCH_SIZE]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&buf);
+            const resp = try client.fetch(.{
+                .location = .{ .url = url },
+                .response_writer = &writer,
+            });
+            if (resp.status != .ok) return Error.NetworkError;
+            self.overwrite(try arena.dupe(u8, writer.buffered()));
+        }
 
-pub const FileBufferSet = struct {
-    const MAX_FETCH_SIZE = 2048;
-    const SetError = error{
-        DuplicateEntry,
-    };
-    file: Io.File,
-    set: std.StringArrayHashMapUnmanaged(void),
-    dirty: bool,
+        pub fn fetch_if_empty_or_force(self: *Self, url: []const u8, client: *std.http.Client, force_fetch: bool) !void {
+            const stat = try self.file.stat(io);
+            if (force_fetch or stat.size == 0) return self.fetch(url, client);
+        }
 
-    pub fn init(name: []const u8) FileBufferSet {
-        const file = zvm_dir.createFile(io, name, .{ .truncate = false, .read = true }) catch |e| fatal("{}: cannot create file: {s}/{s}", .{ e, ZVM_STORAGE_PATH, name });
-        var res = FileBufferSet{
-            .file = file,
-            .set = .empty,
-            .dirty = true,
-        };
-        res.refresh();
-        return res;
-    }
+        pub fn commit(self: *Self) !void {
+            switch (T) {
+                []const u8 => {
+                    var buf: [64]u8 = undefined;
+                    var writer = self.file.writer(io, &buf);
+                    try writer.seekTo(0);
+                    try self.file.setLength(io, 0);
+                    try writer.interface.writeAll(self.data);
+                    try writer.flush();
 
-    pub fn refresh(self: *FileBufferSet) void {
-        if (self.dirty) {
+                },
+                std.StringArrayHashMapUnmanaged(void) => {
+                    var buf: [64]u8 = undefined;
+                    var writer = self.file.writer(io, &buf);
+                    try writer.seekTo(0);
+                    try self.file.setLength(io, 0);
+
+                    var it = self.data.iterator();
+                    while (it.next()) |entry| {
+                        try writer.interface.writeAll(entry.key_ptr.*);
+                        try writer.interface.writeAll("\n");
+                        try writer.flush();
+                    }
+                },
+                else => @compileError("Unsupported type: " ++ @typeName(T)),
+            }
+            self.file.close(io);
+        }
+
+        pub fn clear(self: *Self) void {
+            self.overwrite(&.{});
+        }
+
+        pub fn refresh(self: *Self) void {
             var buf: [256]u8 = undefined;
             var reader = self.file.reader(io, &buf);
             const content = reader.interface.allocRemaining(arena, .unlimited) catch @panic("OOM");
             self.overwrite(content);
-            self.dirty = false;
         }
-    }
 
-    pub fn overwrite(self: *FileBufferSet, buf: []const u8) void {
-        self.set.clearRetainingCapacity();
-        const count = blk: {
-            var lines = std.mem.tokenizeScalar(u8, buf, '\n');
-            var count: usize = 0;
-            while (lines.next()) |_| {
-                count += 1;
-            }
-            break :blk count;
-        };
-        self.set.ensureTotalCapacity(arena, count) catch unreachable;
-        var lines = std.mem.tokenizeScalar(u8, buf, '\n');
-        while (lines.next()) |line| {
-            if (self.set.fetchPut(arena, arena.dupe(u8, line) catch @panic("OOM"), {}) catch unreachable) |kv|
-                fatal("set contains duplicate entry: {s}, something went terribly wrong", .{kv.key});
+        pub fn overwrite_with(self: *Self, new: T) void {
+            self.data = new;
         }
-        assert(self.set.count() == count);
-        self.dirty = true;
-    }
 
-    pub fn overwrite_set(self: *FileBufferSet, new: std.StringArrayHashMapUnmanaged(void)) void {
-        self.set.deinit(arena);
-        self.set = new.clone(arena) catch @panic("OOM");
-        self.dirty = true;
-    }
+        pub fn overwrite(self: *Self, new: []const u8) void {
+            switch (T) {
+                []const u8 => {
+                    self.data = new;
+                },
+                std.StringArrayHashMapUnmanaged(void) => {
+                    self.data.clearRetainingCapacity();
+                    const count = blk: {
+                        var lines = std.mem.tokenizeScalar(u8, new, '\n');
+                        var count: usize = 0;
+                        while (lines.next()) |_| {
+                            count += 1;
+                        }
+                        break :blk count;
+                    };
+                    self.data.ensureTotalCapacity(arena, count) catch unreachable;
+                    var lines = std.mem.tokenizeScalar(u8, new, '\n');
+                    while (lines.next()) |line| {
+                        if (self.data.fetchPut(arena, arena.dupe(u8, line) catch @panic("OOM"), {}) catch unreachable) |kv|
+                            fatal("set contains duplicate entry: {s}, something went terribly wrong", .{kv.key});
+                    }
+                    assert(self.data.count() == count);
 
-    pub fn append_line(self: *FileBufferSet, buf: []const u8) !void {
-        if (self.set.fetchPut(arena, try arena.dupe(u8, buf), {}) catch unreachable) |_| return SetError.DuplicateEntry;
-        self.dirty = true;
-    }
-
-    pub fn remove(self: *FileBufferSet, key: []const u8) void {
-        assert(self.set.swapRemove(key));
-        self.dirty = true;
-    }
-
-    pub fn commit(self: *FileBufferSet) !void {
-        if (self.dirty) {
-            var buf: [256]u8 = undefined;
-            var writer = self.file.writer(io, &buf);
-            try writer.seekTo(0);
-            try self.file.setLength(io, 0);
-
-            var it = self.set.iterator();
-            while (it.next()) |entry| {
-                try writer.interface.writeAll(entry.key_ptr.*);
-                try writer.interface.writeAll("\n");
-            try writer.flush();
+                },
+                else => @compileError("Unsupported type: " ++ @typeName(T)),
             }
         }
-        self.file.close(io);
-    }
-
-    pub fn get(self: FileBufferSet, key: []const u8) bool {
-        return self.set.get(key) != null;
-    }
-
-    pub fn fetch(self: *FileBufferSet, url: []const u8, client: *std.http.Client) !void {
-        log.info("fetching: {s}", .{url});
-        var buf: [MAX_FETCH_SIZE]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buf);
-        const resp = try client.fetch(.{
-            .location = .{ .url = url },
-            .response_writer = &writer,
-        });
-        if (resp.status != .ok) return Error.NetworkError;
-        self.overwrite(try arena.dupe(u8, writer.buffered()));
-        self.dirty = true;
-    }
-
-    pub fn fetch_if_empty_or_force(self: *FileBufferSet, url: []const u8, client: *std.http.Client, force_fetch: bool) !void {
-        if (force_fetch or self.set.count() == 0) return self.fetch(url, client);
-    }
-};
+    };
+}
 
 const Release = struct {
     version: []const u8 = "", // only available when its is a master
@@ -288,15 +235,18 @@ const Index = json.ArrayHashMap(Release);
 pub const OFFICIAL_DOWNLOAD = "https://ziglang.org/download"; // the url directory for "releases". i.e. 0.15.2
 pub const OFFICIAL_BUILDS = "https://ziglang.org/builds"; // the url directory for nightly builds
 
-pub var index_file: FileBuffer = undefined; // $init_on_main
+pub const FileBufferPlain = FileBuffer([]const u8);
+pub const FileBufferSet = FileBuffer(std.StringArrayHashMapUnmanaged(void));
+pub var index_file: FileBufferPlain = undefined; // $init_on_main
 pub var index: Index = undefined; // $init_on_main
 pub var installed_file: FileBufferSet = undefined; // $init_on_main
-pub var master_file: FileBuffer = undefined; // $init_on_main
-pub var use_file: FileBuffer = undefined; // $init_on_main
+pub var master_file: FileBufferPlain = undefined; // $init_on_main
+pub var use_file: FileBufferPlain = undefined; // $init_on_main
 pub var mirror_file: FileBufferSet = undefined; // $init_on_main
 // pub var zig_file: std.Io.File = undefined; // $init_on_main
 pub var zvm_path: []const u8 = undefined; // $init_on_main
 pub var zvm_dir: Io.Dir = undefined; // $init_on_main
+pub var installation_dir: Io.Dir = undefined; // $init_on_main
 pub var arena: std.mem.Allocator = undefined; // $init_on_main
 pub var io: Io = undefined; // $init_on_main
 
@@ -326,12 +276,18 @@ pub fn init(io_: Io, self_path_abs: ?[]const u8) void {
             break :blk std.Io.Dir.openDirAbsolute(io, zvm_path, .{ .iterate = true }) catch fatal("cannot open directory \"{s}\"", .{zvm_path});
         } else fatal("cannot open directory: {}", .{e});
 
-    index_file = .init(INDEX_PATH);
-    installed_file = .init(INSTALLED_PATH);
-    master_file = .init(MASTER_PATH);
-    use_file = .init(USE_PATH);
-    mirror_file = .init(MIRROR_PATH);
+    var group = std.Io.Group.init;
 
+    installation_dir = zvm_dir.createDirPathOpen(io, INSTALLATION_PATH,
+        .{ .open_options = .{ .iterate = true }, .permissions = .default_dir }) catch |e|
+        fatal("cannot create {s}/{s}: {}", .{ zvm_path, INSTALLATION_PATH, e } );
+    group.async(io, FileBufferPlain.init_to, .{ INDEX_PATH, &index_file });
+    group.async(io, FileBufferPlain.init_to, .{ MASTER_PATH, &master_file });
+    group.async(io, FileBufferPlain.init_to, .{ USE_PATH, &use_file });
+    group.async(io, FileBufferSet.init_to, .{ INSTALLED_PATH, &installed_file });
+    group.async(io, FileBufferSet.init_to, .{ MIRROR_PATH, &mirror_file });
+
+    group.await(io) catch unreachable;
 
     if (self_path_abs) |self|
         Io.Dir.cwd().copyFile(self, zvm_dir, ZIG_PATH, io, .{ .make_path = true }) catch |e|
@@ -344,16 +300,16 @@ pub fn fetch_if_force_or_empty(client: *std.http.Client, fetch: bool) void {
         break :fallback false;
     };
     {
-        var json_obj = json.Scanner.initCompleteInput(arena, index_file.buf); // FIXME: do this need to have same lifetime as `index`?
+        var json_obj = json.Scanner.initCompleteInput(arena, index_file.data); // FIXME: do this need to have same lifetime as `index`?
         index = Index.jsonParse(arena, &json_obj, .{ .ignore_unknown_fields = true, .allocate = .alloc_always, .max_value_len = 1024 }) catch |e| fallback: {
-            std.log.debug("index buffer: {s}", .{index_file.buf});
+            std.log.debug("index buffer: {s}", .{index_file.data});
             std.log.err("unxpected error occur while parsing index: {}", .{e});
             if (fresh_index and !main.ask_for_yes("do you want to proceed with the original index?", .{})) {
                 fatal("cannot pasrse zig index", .{});
             }
             json_obj.deinit();
             index_file.refresh();
-            json_obj = json.Scanner.initCompleteInput(arena, index_file.buf);
+            json_obj = json.Scanner.initCompleteInput(arena, index_file.data);
             break :fallback Index.jsonParse(arena, &json_obj, .{ .ignore_unknown_fields = true, .allocate = .alloc_always, .max_value_len = 1024 }) catch |e2| fatal("cannot parse zig index: {}", .{e2});
         };
     }
@@ -365,10 +321,11 @@ pub fn fetch_if_force_or_empty(client: *std.http.Client, fetch: bool) void {
         }
         mirror_file.refresh();
     };
-
 }
 
 pub fn deinit() !void {
+    zvm_dir.close(io);
+    installation_dir.close(io);
     try index_file.commit();
     try installed_file.commit();
     try master_file.commit();

@@ -15,6 +15,7 @@
 //!     Use zig library minizign instead of requiring user to have cli tool minisign installed
 //!   v0.2.1 - 2026-05-04
 //!     Fetches signature file first, then the tarball. Keep signature file in memory.
+//!     Fix list --validate
 //!
 //! License: MIT
 
@@ -155,7 +156,7 @@ const Options = struct {
     release: struct { name: ?[]const u8 },
 
     list: struct {
-        valididate: bool,
+        validate: bool,
     },
 
     mirror: struct {},
@@ -176,10 +177,10 @@ fn free_db(a: Allocator) void {
 
 // this only test latency for now, not throughput
 fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, timeout: i64, arena: Allocator, root: std.Progress.Node) []EndpointThroughput {
-    const mirrors_node = root.startFmt(db.mirror_file.set.count(), "Testing mirror download speed", .{});
-    const throughput_lists = arena.alloc(EndpointThroughput, db.mirror_file.set.count()) catch @panic("OOM");
+    const mirrors_node = root.startFmt(db.mirror_file.data.count(), "Testing mirror download speed", .{});
+    const throughput_lists = arena.alloc(EndpointThroughput, db.mirror_file.data.count()) catch @panic("OOM");
     var mirror_idx: u32 = 0;
-    var it = db.mirror_file.set.iterator();
+    var it = db.mirror_file.data.iterator();
     var group = Io.Group.init;
     while (it.next()) |mirror|: (mirror_idx += 1) {
         const final_url = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ mirror.key_ptr.*, tarball_name }, 0) catch @panic("OOM");
@@ -343,7 +344,8 @@ pub fn ask_for_yes(comptime fmt: []const u8, args: anytype) bool {
     return ask_for_yes(fmt, args);
 }
 
-pub fn zig_main() !void {
+pub fn path_resolve(arena: Allocator, paths: []const []const u8) []const u8 {
+    return std.fs.path.resolve(arena, paths) catch @panic("OOM");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -368,9 +370,10 @@ pub fn main(init: std.process.Init) !void {
 
     const is_shim = std.mem.eql(u8, self_path_base, std.fs.path.basename(db.ZIG_PATH));
     db.init(io, if (!is_shim) self_path else null);
+    defer db.deinit() catch |e| fatal("failed to commit changes: {}", .{e});
     if (is_shim) {
-        const installed_name = db.use_file.buf;
-        const zig_path = std.fs.path.resolve(arena, &.{ db.zvm_path, installed_name, "zig" }) catch @panic("OOM");
+        const installed_name = db.use_file.data;
+        const zig_path = std.fs.path.resolve(arena, &.{ db.zvm_path, db.INSTALLATION_PATH, installed_name, "zig" }) catch @panic("OOM");
 
         var zig_args = std.ArrayList([]const u8).initCapacity(arena, init.minimal.args.vector.len) catch @panic("OOM");
         zig_args.appendAssumeCapacity(zig_path);
@@ -415,7 +418,7 @@ pub fn main(init: std.process.Init) !void {
             .add_opt(bool, &opts.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "update the list of mirror");
 
     const list_cmd = arg_parser.sub_command("list", "list all current installation")
-        .add_opt(bool, &opts.list.valididate, .{ .just = &false }, .{ .prefix = "--validate" }, "", "tries to verify the list of installation");
+        .add_opt(bool, &opts.list.validate, .{ .just = &false }, .{ .prefix = "--validate" }, "", "tries to verify the list of installation");
     // list_cmd.add_opt(bool, &opts.list.valididate, &false, .{.prefix = "--valid"}, "validate and fix the current installation", a);
 
     const use_cmd =
@@ -455,7 +458,6 @@ pub fn main(init: std.process.Init) !void {
 
     db.fetch_if_force_or_empty(&client, opts.fetch);
     // TOOD: rollback changes if any error occur
-    defer db.deinit() catch |e| fatal("failed to commit changes: {}", .{e});
 
     // // this does not work, likely because of bug https://github.com/ziglang/zig/issues/19878
     // try client.initDefaultProxies(arena);
@@ -474,33 +476,33 @@ pub fn main(init: std.process.Init) !void {
     print("\n====================\n\n", .{});
     // handle different command
     if (mirror_cmd.occur) {
-        var mirror_it = db.mirror_file.set.iterator();
+        var mirror_it = db.mirror_file.data.iterator();
         while (mirror_it.next()) |mirror| {
             print("{s}\n", .{mirror.key_ptr.*});
         }
         return;
     } else if (list_cmd.occur) {
-        if (opts.list.valididate) {
+        if (opts.list.validate) {
             print("Valiating zig instsallation...\n", .{});
             var real_installed = std.StringArrayHashMapUnmanaged(void).empty;
-            defer real_installed.deinit(gpa);
+            errdefer real_installed.deinit(gpa);
             var should_overwrite = false;
 
-            var installed_it = db.zvm_dir.iterate();
+            var installed_it = db.installation_dir.iterate();
             while (try installed_it.next(io)) |entry| {
                 if (entry.kind != .directory) continue;
-                if (db.installed_file.set.get(entry.name) == null) {
+                if (db.installed_file.data.get(entry.name) == null) {
                     log.err("direcotry `{s}` does not exist in the list of installation", .{ entry.name });
                     if (ask_for_yes("Do you want to add `{s}` to the list of installation", .{ entry.name })) {
                         should_overwrite = true;
-                        real_installed.putNoClobber(gpa, entry.name, {}) catch @panic("OOM");
+                        real_installed.putNoClobber(arena, entry.name, {}) catch @panic("OOM");
                     }
                 } else {
-                    real_installed.putNoClobber(gpa, entry.name, {}) catch @panic("OOM");
+                    real_installed.putNoClobber(arena, entry.name, {}) catch @panic("OOM");
                 }
             }
 
-            var it = db.installed_file.set.iterator();
+            var it = db.installed_file.data.iterator();
             while (it.next()) |item| {
                 if (real_installed.get(item.key_ptr.*) == null) {
                     log.err("entry `{s}` does not actually exist, deleting it from the list of installations", .{ item.key_ptr.* });
@@ -509,15 +511,15 @@ pub fn main(init: std.process.Init) !void {
             }
 
             if (should_overwrite) {
-                db.installed_file.overwrite_set(real_installed);
+                db.installed_file.overwrite_with(real_installed);
                 print("Overwriting existing list, new list:\n", .{});
             } else {
                 print("Everything seems fine.\n", .{});
             }
             print("\n", .{});
         }
-        var it = db.installed_file.set.iterator();
-        print("installed zig: {}\n", .{db.installed_file.set.count()});
+        var it = db.installed_file.data.iterator();
+        print("installed zig: {}\n", .{db.installed_file.data.count()});
         while (it.next()) |entry| {
             print("{s}\n", .{entry.key_ptr.*});
         }
@@ -547,10 +549,10 @@ pub fn main(init: std.process.Init) !void {
         // this is the name of the release the to used.
         // A symlink would be created targeting the folder named `installed_name`.
         // For `master`, we need to retreive its commit
-        const installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.buf else opts.install.release });
-        if (!db.installed_file.get(installed_name))
+        const installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.data else opts.install.release });
+        if (db.installed_file.data.get(installed_name) == null)
             fatal("{s} is not installed", .{installed_name});
-        if (std.mem.eql(u8, db.use_file.buf, installed_name)) {
+        if (std.mem.eql(u8, db.use_file.data, installed_name)) {
             print("{s} already in use\n", .{installed_name});
         }
 
@@ -558,21 +560,20 @@ pub fn main(init: std.process.Init) !void {
         print("{s} up and running!\n", .{ installed_name });
         return;
     } else if (uninstall_cmd.occur) {
-        const installed_name = try allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.buf else opts.install.release });
+        const installed_name = try allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.data else opts.install.release });
         defer gpa.free(installed_name);
 
-        if (!db.installed_file.get(installed_name))
+        if (db.installed_file.data.get(installed_name) == null)
             fatal("{s} is not installed", .{installed_name});
         if (!ask_for_yes("removing installation {s}", .{installed_name})) return;
         db.zvm_dir.deleteTree(io, installed_name) catch |e| {
             log.err("{}: failed to delete installation {s}", .{ e, installed_name });
             return e;
         };
-        db.installed_file.remove(installed_name);
+        _ = db.installed_file.data.swapRemove(installed_name);
 
-        if (std.mem.eql(u8, db.use_file.buf, installed_name)) {
-            @panic("TODO");
-            // log.info("{s} is no longer in use", .{db.use_file.buf});
+        if (std.mem.eql(u8, db.use_file.data, installed_name)) {
+            log.info("{s} is no longer in use", .{db.use_file.data});
             // db.zvm_dir.deleteFile(io, "zig") catch {};
             // db.use_file.clear();
         }
@@ -592,13 +593,13 @@ pub fn main(init: std.process.Init) !void {
                 const idx = std.mem.lastIndexOf(u8, basename, ".tar") orelse
                     fatal("file does not start ends with `.tar`", .{});
                 const folder_name = basename[0..idx];
-                if (db.installed_file.get(folder_name))
+                if (db.installed_file.data.get(folder_name)) |_|
                     fatal("{s} already existed as an installation", .{folder_name});
-                try decompress_tarball(opts.add.path, db.ZVM_STORAGE_PATH, prog_root);
+                try decompress_tarball(opts.add.path, path_resolve(arena, &.{ db.zvm_path, db.INSTALLATION_PATH }), prog_root);
                 break :blk folder_name;
             },
             .directory => blk: {
-                if (db.installed_file.get(basename))
+                if (db.installed_file.data.get(basename)) |_|
                     fatal("{s} already existed as an installation", .{opts.add.path});
                 try std.Io.Dir.renameAbsolute(opts.add.path, try std.fs.path.resolve(arena, &.{ db.zvm_path, basename }), io);
                 break :blk basename;
@@ -607,7 +608,7 @@ pub fn main(init: std.process.Init) !void {
                 fatal("<path> ({s}) must be either a tar file or a directory", .{opts.add.path});
             },
         };
-        db.installed_file.append_line(installed_name) catch unreachable;
+        db.installed_file.data.putNoClobber(db.arena, installed_name, {}) catch unreachable;
         return;
     } else if (install_cmd.occur) {
         const latest_master = db.index.map.get("master").?.version;
@@ -616,14 +617,14 @@ pub fn main(init: std.process.Init) !void {
 
         const install_node = prog_root.startFmt(4, "Installing {s}", .{ installed_name });
         defer install_node.end();
-        if (db.installed_file.get(installed_name)) {
+        if (db.installed_file.data.get(installed_name)) |_| {
             print("{s} is already installed, do `zvm use {s}` to use it\n", .{ installed_name, opts.install.release });
             return;
         }
         // if we are install a master, and there is a master already installed, that this different from the latest master.
-        if (is_master and db.master_file.buf.len != 0) {
-            if (std.mem.eql(u8, db.master_file.buf, latest_master)) @panic("Something went wrong: the latest master should not have been installed.");
-            if (!ask_for_yes("Trying to installed latest master {s}, but master {s} already installed, do you want to overwiter it?", .{ latest_master, db.master_file.buf })) return;
+        if (is_master and db.master_file.data.len != 0) {
+            if (std.mem.eql(u8, db.master_file.data, latest_master)) @panic("Something went wrong: the latest master should not have been installed.");
+            if (!ask_for_yes("Trying to installed latest master {s}, but master {s} already installed, do you want to overwiter it?", .{ latest_master, db.master_file.data })) return;
         }
 
         const release = db.index.map.get(opts.install.release) orelse {
@@ -719,17 +720,17 @@ pub fn main(init: std.process.Init) !void {
         //
         // Decompress tarball
         //
-        try decompress_tarball(output_path, db.zvm_path, install_node);
+        try decompress_tarball(output_path, path_resolve(arena, &.{ db.zvm_path, db.INSTALLATION_PATH }), install_node);
         install_node.completeOne();
         try Io.Dir.deleteFileAbsolute(io, output_path);
 
         if (is_master) {
-            const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, db.master_file.buf });
+            const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, db.master_file.data });
             try db.zvm_dir.deleteTree(io, master_locked_installed_name);
             db.master_file.overwrite(latest_master);
         }
 
-        try db.installed_file.append_line(installed_name);
+        try db.installed_file.data.putNoClobber(db.arena, installed_name, {});
 
         print("{s} installed! run `zvm use` to use it", .{installed_name});
     } else unreachable;
