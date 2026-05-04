@@ -19,13 +19,13 @@ pub fn get_git_commit(b: *std.Build) []const u8 {
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.resolveTargetQuery(.{});
-    const opt = b.standardOptimizeOption(.{});
+    const target = b.standardTargetOptions(.{});
+    const opt = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
+    const is_release = opt != .Debug;
 
     // const git_commit = b.option([]conts u8, "commit", "git commit") orelse "";
     const options = b.addOptions();
-    const git_commit = get_git_commit(b);
-    options.addOption([]const u8, "commit", git_commit);
+    options.addOption(?[]const u8, "commit", if (is_release) null else get_git_commit(b));
 
     const zvm_mod = b.addModule("zvm", .{
         .optimize = opt,
@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     });
     zvm_mod.addOptions("build", options);
     const zvm = b.addExecutable(.{
-        .name = "zvm",
+        .name = if (is_release) b.fmt("zvm-{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) }) else "zvm",
         .root_module = zvm_mod,
     });
 
