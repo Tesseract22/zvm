@@ -1,22 +1,20 @@
 //! Author:      Tesseract22
-//! Version:     v0.2.0
+//! Version:     v0.2.1
 //! Date:        2026-04-26
 //!
 //! Description: Zig Version Manager
 //!
 //! Changelog:
 //!   v0.1.0 - 2026-04-26 - Initial release
-//!   v0.1.1 - 2026-04-26
-//!     Refactor with database abstraction
+//!   v0.2.0 - 2026-05-03
 //!     Added `nuke` command
-//!   v0.1.2 - 2026-04-28
 //!     Upgrade to zig 0.16.0, use io.async to speed to mirror speed test
 //!     Add '--validate' option to `list` command
-//!   v0.1.3 - 2026-04-28
 //!     Rework mirror speed test, add `--timeout` options to `install` command
-//!   v0.2.0 - 2026-05-03
-//!     Adpat to windows, use a shim exe instead of symlink to "activate" a installationb
-//!     Use zig library minizign instead of cli tool minisign
+//!     Adpat to windows, use a shim exe instead of symlink to "activate" a installation
+//!     Use zig library minizign instead of requiring user to have cli tool minisign installed
+//!   v0.2.1 - 2026-05-04
+//!     Fetches signature file first, then the tarball. Keep signature file in memory.
 //!
 //! License: MIT
 
@@ -25,7 +23,7 @@
 // - being able to install specific commit
 // - Add command to set env var
 // - per-folder config with .env
-const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 0, .build = @import("build").commit };
+const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 1, .build = @import("build").commit };
 
 const PUBLIC_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
 const pk = minizign.PublicKey.decodeFromBase64(PUBLIC_KEY) catch unreachable;
@@ -147,22 +145,20 @@ const Error = error{
 };
 
 const Options = struct {
+    fetch: bool,
     install: struct {
         release: []const u8,
         mirror: ?[]const u8,
         timeout: i64,
-        fetch: bool,
     },
 
-    release: struct { fetch: bool, name: ?[]const u8 },
+    release: struct { name: ?[]const u8 },
 
     list: struct {
         valididate: bool,
     },
 
-    mirror: struct {
-        fetch: bool,
-    },
+    mirror: struct {},
 
     add: struct {
         path: []const u8,
@@ -258,6 +254,7 @@ fn download_to_writer(client: *std.http.Client, url: []const u8, writer: *Io.Wri
     const start_t = std.Io.Timestamp.now(io, .awake).toMicroseconds();
     var offset: usize = 0;
     while (offset < max_size) {
+        io.checkCancel() catch break;
         const content = reader.take(64) catch |err| switch (err) {
             error.EndOfStream => {
                 offset += try reader.streamRemaining(writer);
@@ -278,27 +275,13 @@ fn download_to_writer(client: *std.http.Client, url: []const u8, writer: *Io.Wri
 }
 
 fn verify_tarball(
-    client: *std.http.Client,
     tarball_path: []const u8,tarball_name: []const u8,
-    sig_url: [:0]const u8, gpa: Allocator, root: std.Progress.Node) !void {
-    const sig_path = try allocPrint(gpa, "{s}/{s}.minisig", .{ db.temp_folder_path, tarball_name });
-    defer gpa.free(sig_path);
-    const verify_node = root.startFmt(2, "Verifying {s}", .{ tarball_name });
-    defer verify_node.end();
-    _ = download_to_path(client, sig_url, sig_path, null, verify_node) catch |e| {
-        switch (e) {
-            Error.NotFoundError =>
-                log.err("the signature file does not exist at `{s}`, probably because you are downloading a non-release build that is not the latest, try rerun with `--fetch`", .{ sig_url }),
-            else => {},
-        }
-        return e;
-    };
+    sig: minizign.Signature, gpa: Allocator, root: std.Progress.Node) !void {
+
     const tarball_f = try Io.Dir.openFileAbsolute(io, tarball_path, .{});
     defer tarball_f.close(io);
-
-    var sig = try minizign.Signature.fromFile(gpa, sig_path, io);
-    defer sig.deinit();
-    try pk.verifyFile(gpa, io, tarball_f, sig, null);
+    const verify_node = root.startFmt(2, "Verifying {s}", .{ tarball_name });
+        try pk.verifyFile(gpa, io, tarball_f, sig, null);
     verify_node.completeOne();
 }
 
@@ -413,14 +396,14 @@ pub fn main(init: std.process.Init) !void {
     // `add` command that adds a local folder to the list of installation
     const release_cmd =
         arg_parser.sub_command("release", "(fetch and) list the currently avaiable releases")
-            .add_opt(bool, &opts.release.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "update the db.index of releases")
+            .add_opt(bool, &opts.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "update the db.index of releases")
             .add_opt(?[]const u8, &opts.release.name, .{ .just = &null }, .positional, "<release-name>", "print details for this specific release");
 
     const install_cmd =
         arg_parser.sub_command("install", "install a release")
             .add_opt([]const u8, &opts.install.release, .none, .positional, "<release>", "the releaset to download, see `zvm list`")
             .add_opt(?[]const u8, &opts.install.mirror, .{ .just = &null }, .{ .prefix = "--mirror" }, "<mirror>", "the mirror to use")
-            .add_opt(bool, &opts.install.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "<seconds>", "fetch the latest db.index and mirrors before install")
+            .add_opt(bool, &opts.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "<seconds>", "fetch the latest db.index and mirrors before install")
             .add_opt(i64, &opts.install.timeout, .{ .just = &5 }, .{ .prefix = "--timeout" }, "", "the timeout to use for testing speed in mirrors (experimental)");
 
     const uninstall_cmd =
@@ -429,7 +412,7 @@ pub fn main(init: std.process.Init) !void {
 
     const mirror_cmd =
         arg_parser.sub_command("mirror", "fetch and list all the known mirrors")
-            .add_opt(bool, &opts.mirror.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "update the list of mirror");
+            .add_opt(bool, &opts.fetch, .{ .just = &false }, .{ .prefix = "--fetch" }, "", "update the list of mirror");
 
     const list_cmd = arg_parser.sub_command("list", "list all current installation")
         .add_opt(bool, &opts.list.valididate, .{ .just = &false }, .{ .prefix = "--validate" }, "", "tries to verify the list of installation");
@@ -447,8 +430,6 @@ pub fn main(init: std.process.Init) !void {
         arg_parser.sub_command("nuke", "nuke the whole zvm installation");
 
     try arg_parser.parse(&args);
-    opts.mirror.fetch = opts.mirror.fetch or opts.install.fetch;
-    opts.release.fetch = opts.release.fetch or opts.install.fetch;
 
     if (arg_parser.root_command.occur) {
         arg_parser.print_help();
@@ -472,7 +453,7 @@ pub fn main(init: std.process.Init) !void {
     defer prog_root.end();
 
 
-    db.fetch_if_force_or_empty(&client, opts.release.fetch);
+    db.fetch_if_force_or_empty(&client, opts.fetch);
     // TOOD: rollback changes if any error occur
     defer db.deinit() catch |e| fatal("failed to commit changes: {}", .{e});
 
@@ -650,6 +631,7 @@ pub fn main(init: std.process.Init) !void {
             print_list_of_releases();
             std.process.abort();
         };
+
         const download = release.platforms.get(double_str) orelse
             fatal("No {s} found for {s}, run `zvm release {s}` to see the available platform.", .{ double_str, double_str, opts.install.release });
         const tarball_size = std.fmt.parseInt(usize, download.size, 10) catch unreachable;
@@ -667,6 +649,30 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(path);
 
         const tarball_name = std.fs.path.basename(path);
+
+        var sig = blk: {
+            const sig_url = if (!is_master)
+                std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, opts.install.release, tarball_name }, 0) catch @panic("OOM")
+                else
+                    std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{ db.OFFICIAL_BUILDS, tarball_name }, 0) catch @panic("OOM");
+
+            log.debug("signature url: {s}", .{sig_url});
+
+            const sig_node = install_node.startFmt(2, "Verifying {s}", .{ tarball_name });
+            defer sig_node.end();
+            var sig_writer = Io.Writer.Allocating.init(gpa);
+            defer sig_writer.deinit();
+            _ = download_to_writer(&client, sig_url, &sig_writer.writer, null, sig_node) catch |e| {
+                switch (e) {
+                    Error.NotFoundError =>
+                        log.err("the signature file does not exist at `{s}`, probably because you are downloading a non-release build that is not the latest, try rerun with `--fetch`", .{ sig_url }),
+                    else => {},
+                }
+                return e;
+            };
+            break :blk try minizign.Signature.decode(gpa, sig_writer.written());
+        };
+        defer sig.deinit();
 
         const output_path = std.fs.path.resolve(gpa, &.{ db.temp_folder_path, tarball_name }) catch @panic("OOM");
         defer gpa.free(output_path);
@@ -707,12 +713,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Verify tarball
         //
-        const sig_url = if (!is_master)
-            std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, opts.install.release, tarball_name }, 0) catch @panic("OOM")
-        else
-            std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, tarball_name }, 0) catch @panic("OOM");
-        log.debug("signature url: {s}", .{sig_url});
-        verify_tarball(&client, output_path, tarball_name, sig_url, gpa, install_node) catch |e|
+        verify_tarball(output_path, tarball_name, sig, gpa, install_node) catch |e|
             fatal("{} failed to verify signature of {s}, potentially dangerous source", .{ e, output_path });
 
         //
