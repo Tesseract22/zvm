@@ -22,6 +22,10 @@ pub const ArgParser = struct {
         self.root_command.* = .{ .root = self, .desc = desc, .name = pgm_name };
     }
 
+    pub fn add_opt_global(self: *ArgParser, comptime T: type, ref: *T, default: Command.Maybe(T), arg_ty: ArgType, meta_var_name: []const u8, desc: []const u8) void {
+        self.root_command.add_opt_global(T, ref, default, arg_ty, meta_var_name, desc); 
+    }
+
     pub const Command = struct {
         root: *ArgParser,
         prefix_args: std.StringHashMapUnmanaged(Parse) = .empty,
@@ -55,6 +59,14 @@ pub const ArgParser = struct {
                 .positional => self.postional_args.append(gpa, p) catch unreachable,
             }
             return self;
+        }
+
+        pub fn add_opt_global(self: *Command, comptime T: type, ref: *T, default: Maybe(T), arg_ty: ArgType, meta_var_name: []const u8, desc: []const u8) void {
+
+            var it = self.sub_commands.iterator();
+            while (it.next()) |entry| {
+                _ = entry.value_ptr.*.add_opt(T, ref, default, arg_ty, meta_var_name, desc);
+            }
         }
 
         pub fn sub_command(self: *Command, name: []const u8, desc: []const u8) *Command {

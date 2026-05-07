@@ -1,6 +1,6 @@
 //! Author:      Tesseract22
-//! Version:     v0.2.1
-//! Date:        2026-04-26
+//! Version:     v0.2.2
+//! Date:        2026-05-06
 //!
 //! Description: Zig Version Manager
 //!
@@ -16,15 +16,18 @@
 //!   v0.2.1 - 2026-05-04
 //!     Fetches signature file first, then the tarball. Keep signature file in memory.
 //!     Fix list --validate
+//!   v0.2.2 - 2026-05-06
+//!     Use stdout for print
+//!     Use zig implementatio of decompression and extracting tar
+//!     Add --platform flag to specify platform double
 //!
 //! License: MIT
 
 // TODO
-// - fetch with thread pool?
 // - being able to install specific commit
 // - Add command to set env var
 // - per-folder config with .env
-const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 1, .build = @import("build").commit };
+const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 2, .build = @import("build").commit };
 
 const PUBLIC_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
 const pk = minizign.PublicKey.decodeFromBase64(PUBLIC_KEY) catch unreachable;
@@ -35,8 +38,9 @@ const log = std.log;
 const fatal = std.process.fatal;
 const json = std.json;
 const Allocator = std.mem.Allocator;
-const allocPrint = std.fmt.allocPrint;
-const print = std.debug.print;
+fn allocPrint(allocator: Allocator, comptime fmt: []const u8, args: anytype) []u8 {
+    return std.fmt.allocPrint(allocator, fmt, args) catch @panic("OOM");
+} 
 const Io = std.Io;
 
 const builtin = @import("builtin");
@@ -147,6 +151,7 @@ const Error = error{
 
 const Options = struct {
     fetch: bool,
+    platform: ?[]const u8,
     install: struct {
         release: []const u8,
         mirror: ?[]const u8,
@@ -183,7 +188,7 @@ fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, timeo
     var it = db.mirror_file.data.iterator();
     var group = Io.Group.init;
     while (it.next()) |mirror|: (mirror_idx += 1) {
-        const final_url = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ mirror.key_ptr.*, tarball_name }, 0) catch @panic("OOM");
+        const final_url = allocPrint(arena, "{s}/{s}", .{ mirror.key_ptr.*, tarball_name });
         group.async(io, download_test_spd, .{ client, final_url, 1<<20, &throughput_lists[mirror_idx], mirrors_node });
     }
     io.sleep(.fromSeconds(timeout), .awake) catch unreachable;
@@ -196,7 +201,7 @@ fn test_fastest_mirror(client: *std.http.Client, tarball_name: []const u8, timeo
 }
 
 fn download_test_spd(
-    client: *std.http.Client, url: [:0]const u8,
+    client: *std.http.Client, url: []const u8,
     cancel_size: ?usize, latency_slot: *EndpointThroughput,
     root: std.Progress.Node) Io.Cancelable!void {
 
@@ -216,10 +221,16 @@ fn download_to_path(client: *std.http.Client, url: []const u8, dest: []const u8,
     log.debug("fetching {s} into {s}", .{ url, dest });
     const f = try Io.Dir.createFileAbsolute(io, dest, .{});
     defer f.close(io);
+
+    return download_to_file(client, url, f, cancel_size, root);
+}
+
+fn download_to_file(client: *std.http.Client, url: []const u8, f: Io.File, cancel_size: ?usize, root: std.Progress.Node) !f32 {
     var write_buf: [1024*8]u8 = undefined;
     var writer = f.writer(io, &write_buf);
 
     return download_to_writer(client, url, &writer.interface, cancel_size, root);
+
 }
 
 fn download_to_writer(client: *std.http.Client, url: []const u8, writer: *Io.Writer, cancel_size: ?usize, root: std.Progress.Node) !f32 {
@@ -276,32 +287,33 @@ fn download_to_writer(client: *std.http.Client, url: []const u8, writer: *Io.Wri
 }
 
 fn verify_tarball(
-    tarball_path: []const u8,tarball_name: []const u8,
+    tarball_f: Io.File,
     sig: minizign.Signature, gpa: Allocator, root: std.Progress.Node) !void {
 
-    const tarball_f = try Io.Dir.openFileAbsolute(io, tarball_path, .{});
-    defer tarball_f.close(io);
-    const verify_node = root.startFmt(2, "Verifying {s}", .{ tarball_name });
-        try pk.verifyFile(gpa, io, tarball_f, sig, null);
-    verify_node.completeOne();
+    const verify_node = root.startFmt(1, "Verifying", .{});
+    defer verify_node.end();
+    try pk.verifyFile(gpa, io, tarball_f, sig, null);
 }
 
-fn decompress_tarball(tarball_path: []const u8, output_dir: []const u8, root: std.Progress.Node) !void {
+fn decompress_tarball(tarball_path: []const u8, tarball_f: Io.File, gpa: Allocator, root: std.Progress.Node) !void {
     const node = root.startFmt(1, "Decompressing {s}", .{ tarball_path });
     defer node.end();
-    var tar = try std.process.spawn(io, .{
-        .argv = &.{ "tar", "xf", tarball_path, "-C", output_dir }
-    });
-    const tar_term = try tar.wait(io);
-    switch (tar_term) {
-        .exited => |exit_code| {
-            log.info("tar exited with {}", .{exit_code});
-            if (exit_code != 0) return Error.DecompressionError;
-        },
-        else => |other| {
-            log.err("tar terminated unxpectedly {}", .{other});
-            return Error.DecompressionError;
-        },
+
+    var buf: [1024]u8 = undefined;
+    var reader = tarball_f.reader(io, &buf);
+
+
+    const ext = std.fs.path.extension(tarball_path);
+    const base = std.fs.path.basename(tarball_path);
+    if (std.mem.eql(u8, ext, ".xz")) {
+        assert(std.mem.eql(u8, std.fs.path.extension(base), ".tar"));
+
+        var xz = try std.compress.xz.Decompress.init(&reader.interface , gpa, gpa.alloc(u8, 1024) catch @panic("OOM"));
+        defer xz.deinit();
+
+        try std.tar.extract(io, db.installation_dir, &xz.reader, .{});
+    } else if (std.mem.eql(u8, ext, ".zip"))  {
+        try std.zip.extract(db.installation_dir, &reader, .{});
     }
 }
 
@@ -322,23 +334,27 @@ fn print_list_of_releases() void {
     }
 }
 
-pub var stdin: std.Io.File = undefined;
+pub fn print(comptime fmt: []const u8, args: anytype) void {
+    stdout.print(fmt, args) catch unreachable;
+}
+
+pub var stdin: *Io.Reader = undefined;
+pub var stdout: *Io.Writer = undefined;
 pub var io: Io = undefined;
 
 pub fn ask_for_yes(comptime fmt: []const u8, args: anytype) bool {
     print(fmt ++ "\n", args);
     print("y[es], n[o]? ", .{});
+    stdout.flush() catch unreachable;
     var buf: [32]u8 = undefined;
-    var reader = stdin.reader(io, &buf);
-    var buf2: [32]u8 = undefined;
-    var yes_or_no = reader.interface.takeDelimiterExclusive('\n') catch |e| {
+    var yes_or_no = stdin.takeDelimiterExclusive('\n') catch |e| {
         if (e == error.StreamTooLong) return ask_for_yes(fmt, args);
         std.log.err("{}: you mean no? fine.", .{e});
         return false;
     };
     // on windows, newlien is \r\n
     if (yes_or_no.len > 0 and yes_or_no[yes_or_no.len - 1] == '\r')  yes_or_no = yes_or_no[0..yes_or_no.len-1];
-    const lower = std.ascii.lowerString(&buf2, yes_or_no);
+    const lower = std.ascii.lowerString(&buf, yes_or_no);
     if (std.mem.eql(u8, lower, "y") or std.mem.eql(u8, lower, "yes")) return true;
     if (std.mem.eql(u8, lower, "n") or std.mem.eql(u8, lower, "no")) return false;
     return ask_for_yes(fmt, args);
@@ -351,7 +367,16 @@ pub fn path_resolve(arena: Allocator, paths: []const []const u8) []const u8 {
 pub fn main(init: std.process.Init) !void {
     var gpa = init.gpa;
     io = init.io;
-    stdin = std.Io.File.stdin();
+    var stdin_buf: [64]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+    stdin = &stdin_reader.interface;
+
+    var stdout_buf: [64]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+    stdout = &stdout_writer.interface;
+    defer stdout.flush() catch unreachable;
+
+
     var arena_alloc = std.heap.ArenaAllocator.init(gpa);
     defer arena_alloc.deinit();
     const arena = arena_alloc.allocator();
@@ -432,6 +457,8 @@ pub fn main(init: std.process.Init) !void {
     const nuke_cmd =
         arg_parser.sub_command("nuke", "nuke the whole zvm installation");
 
+    arg_parser.add_opt_global(?[]const u8, &opts.platform, .{ .just = &null }, .{ .prefix = "--platform" }, "<platform-double>", "specify the platform to download from, such as `x86_64-linux. defaults to the platform zvm is running on`");
+
     try arg_parser.parse(&args);
 
     if (arg_parser.root_command.occur) {
@@ -469,8 +496,9 @@ pub fn main(init: std.process.Init) !void {
     //
     // detect the current platform
     //
-    const double_str = try allocPrint(arena, "{s}-{s}", .{ @tagName(builtin.cpu.arch), @tagName(builtin.target.os.tag) });
-    log.info("Detected system: {s}", .{double_str});
+    const double_str = opts.platform 
+        orelse allocPrint(arena, "{s}-{s}", .{ @tagName(builtin.cpu.arch), @tagName(builtin.target.os.tag) });
+    log.info("Platform: {s}", .{double_str});
     // for `install`, this is the release to
 
     print("\n====================\n\n", .{});
@@ -549,7 +577,7 @@ pub fn main(init: std.process.Init) !void {
         // this is the name of the release the to used.
         // A symlink would be created targeting the folder named `installed_name`.
         // For `master`, we need to retreive its commit
-        const installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.data else opts.install.release });
+        const installed_name = allocPrint(arena, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.data else opts.install.release });
         if (db.installed_file.data.get(installed_name) == null)
             fatal("{s} is not installed", .{installed_name});
         if (std.mem.eql(u8, db.use_file.data, installed_name)) {
@@ -560,13 +588,13 @@ pub fn main(init: std.process.Init) !void {
         print("{s} up and running!\n", .{ installed_name });
         return;
     } else if (uninstall_cmd.occur) {
-        const installed_name = try allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.data else opts.install.release });
+        const installed_name = allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) db.master_file.data else opts.install.release });
         defer gpa.free(installed_name);
 
         if (db.installed_file.data.get(installed_name) == null)
             fatal("{s} is not installed", .{installed_name});
         if (!ask_for_yes("removing installation {s}", .{installed_name})) return;
-        db.zvm_dir.deleteTree(io, installed_name) catch |e| {
+        db.installation_dir.deleteTree(io, installed_name) catch |e| {
             log.err("{}: failed to delete installation {s}", .{ e, installed_name });
             return e;
         };
@@ -595,7 +623,7 @@ pub fn main(init: std.process.Init) !void {
                 const folder_name = basename[0..idx];
                 if (db.installed_file.data.get(folder_name)) |_|
                     fatal("{s} already existed as an installation", .{folder_name});
-                try decompress_tarball(opts.add.path, path_resolve(arena, &.{ db.zvm_path, db.INSTALLATION_PATH }), prog_root);
+                try decompress_tarball(opts.add.path, f, gpa, prog_root);
                 break :blk folder_name;
             },
             .directory => blk: {
@@ -612,8 +640,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     } else if (install_cmd.occur) {
         const latest_master = db.index.map.get("master").?.version;
-        const installed_name = try allocPrint(gpa, "zig-{s}-{s}", .{ double_str, if (is_master) latest_master else opts.install.release });
-        defer gpa.free(installed_name);
+        const installed_name = allocPrint(arena, "zig-{s}-{s}", .{ double_str, if (is_master) latest_master else opts.install.release });
 
         const install_node = prog_root.startFmt(4, "Installing {s}", .{ installed_name });
         defer install_node.end();
@@ -653,9 +680,9 @@ pub fn main(init: std.process.Init) !void {
 
         var sig = blk: {
             const sig_url = if (!is_master)
-                std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, opts.install.release, tarball_name }, 0) catch @panic("OOM")
+                    allocPrint(arena, "{s}/{s}/{s}.minisig", .{ db.OFFICIAL_DOWNLOAD, opts.install.release, tarball_name })
                 else
-                    std.fmt.allocPrintSentinel(arena, "{s}/{s}.minisig", .{ db.OFFICIAL_BUILDS, tarball_name }, 0) catch @panic("OOM");
+                    allocPrint(arena, "{s}/{s}.minisig", .{ db.OFFICIAL_BUILDS, tarball_name });
 
             log.debug("signature url: {s}", .{sig_url});
 
@@ -675,17 +702,21 @@ pub fn main(init: std.process.Init) !void {
         };
         defer sig.deinit();
 
-        const output_path = std.fs.path.resolve(gpa, &.{ db.temp_folder_path, tarball_name }) catch @panic("OOM");
-        defer gpa.free(output_path);
+        const tarball_path = std.fs.path.resolve(gpa, &.{ db.temp_folder_path, tarball_name }) catch @panic("OOM");
+        defer gpa.free(tarball_path);
 
         const throughput_list: []const EndpointThroughput = if (opts.install.mirror) |mirror|
-            &.{ EndpointThroughput { .spd = 100 , .url = allocPrint(arena, "{s}/{s}", .{ mirror, tarball_name }) catch @panic("OOM") } }
+            &.{ EndpointThroughput { .spd = 100 , .url = allocPrint(arena, "{s}/{s}", .{ mirror, tarball_name }) } }
         else
             test_fastest_mirror(&client, tarball_name, opts.install.timeout, arena, install_node);
         // const latencies_sorted: []const Latency = if (opts.install.mirror) |mirror| &.{.{ @as(i64, 0), mirror }} else test_fastest_mirror(&client, gpa);
         // defer if (latencies_sorted.len > 1) gpa.free(latencies_sorted);
-        var first_time = true;
 
+        log.debug("tarbal path: {s}", .{ tarball_path });
+        var tarball_f = try Io.Dir.createFileAbsolute(io, tarball_path, .{ .truncate = true, .read = true });
+        defer tarball_f.close(io);
+
+        var first_time = true;
         for (throughput_list) |item| {
             log.info("{s}, speed: {} MB/s", .{ item.url, item.spd/(1<<20) });
             if (item.spd == 0) {
@@ -699,7 +730,7 @@ pub fn main(init: std.process.Init) !void {
             //
             // Download zig
             //
-            _ = download_to_path(&client, item.url, output_path, null, install_node) catch |e| {
+            _ = download_to_file(&client, item.url, tarball_f, null, install_node) catch |e| {
                 switch (e) {
                     Error.NotFoundError => log.err("this specific mirror does not have this release", .{}),
                     else => log.err("cannot fetch `{s}`: {}", .{ item.url, e }),
@@ -714,18 +745,18 @@ pub fn main(init: std.process.Init) !void {
 
         // Verify tarball
         //
-        verify_tarball(output_path, tarball_name, sig, gpa, install_node) catch |e|
-            fatal("{} failed to verify signature of {s}, potentially dangerous source", .{ e, output_path });
+        verify_tarball(tarball_f, sig, gpa, install_node) catch |e|
+            fatal("{} failed to verify signature of {s}, potentially dangerous source", .{ e, tarball_path });
 
         //
         // Decompress tarball
         //
-        try decompress_tarball(output_path, path_resolve(arena, &.{ db.zvm_path, db.INSTALLATION_PATH }), install_node);
+        try decompress_tarball(tarball_path, tarball_f, gpa, install_node);
         install_node.completeOne();
-        try Io.Dir.deleteFileAbsolute(io, output_path);
+        try Io.Dir.deleteFileAbsolute(io, tarball_path);
 
         if (is_master) {
-            const master_locked_installed_name = try allocPrint(arena, "zig-{s}-{s}", .{ double_str, db.master_file.data });
+            const master_locked_installed_name = allocPrint(arena, "zig-{s}-{s}", .{ double_str, db.master_file.data });
             try db.zvm_dir.deleteTree(io, master_locked_installed_name);
             db.master_file.overwrite(latest_master);
         }
