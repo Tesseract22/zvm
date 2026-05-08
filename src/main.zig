@@ -1,6 +1,6 @@
 //! Author:      Tesseract22
-//! Version:     v0.2.2
-//! Date:        2026-05-06
+//! Version:     v0.2.3
+//! Date:        2026-05-08
 //!
 //! Description: Zig Version Manager
 //!
@@ -20,6 +20,9 @@
 //!     Use stdout for print
 //!     Use zig implementatio of decompression and extracting tar
 //!     Add --platform flag to specify platform double
+//!     Improve help message format
+//!  v0.2.3 - 2026-05-08
+//!     Fix bug where two instance of shim will lock each other
 //!
 //! License: MIT
 
@@ -27,7 +30,7 @@
 // - being able to install specific commit
 // - Add command to set env var
 // - per-folder config with .env
-const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 2, .build = @import("build").commit };
+const VERSION = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 3, .build = @import("build").commit };
 
 const PUBLIC_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"; // public key used to verify zig tarball
 const pk = minizign.PublicKey.decodeFromBase64(PUBLIC_KEY) catch unreachable;
@@ -347,11 +350,11 @@ pub fn ask_for_yes(comptime fmt: []const u8, args: anytype) bool {
     print("y[es], n[o]? ", .{});
     stdout.flush() catch unreachable;
     var buf: [32]u8 = undefined;
-    var yes_or_no = stdin.takeDelimiterExclusive('\n') catch |e| {
+    var yes_or_no = stdin.takeDelimiter('\n') catch |e| {
         if (e == error.StreamTooLong) return ask_for_yes(fmt, args);
         std.log.err("{}: you mean no? fine.", .{e});
         return false;
-    };
+    } orelse "";
     // on windows, newlien is \r\n
     if (yes_or_no.len > 0 and yes_or_no[yes_or_no.len - 1] == '\r')  yes_or_no = yes_or_no[0..yes_or_no.len-1];
     const lower = std.ascii.lowerString(&buf, yes_or_no);
@@ -395,7 +398,7 @@ pub fn main(init: std.process.Init) !void {
 
     const is_shim = std.mem.eql(u8, self_path_base, std.fs.path.basename(db.ZIG_PATH));
     db.init(io, if (!is_shim) self_path else null);
-    defer db.deinit() catch |e| fatal("failed to commit changes: {}", .{e});
+    log.debug("database loaded", .{});
     if (is_shim) {
         const installed_name = db.use_file.data;
         const zig_path = std.fs.path.resolve(arena, &.{ db.zvm_path, db.INSTALLATION_PATH, installed_name, "zig" }) catch @panic("OOM");
@@ -405,6 +408,7 @@ pub fn main(init: std.process.Init) !void {
         while (args.next()) |arg| {
             zig_args.appendAssumeCapacity(arg);
         }
+        db.deinit() catch @panic("unreahcable");
         // init.minimal.args.vector
         var zig = std.process.spawn(io, .{
             .argv = zig_args.items,
@@ -412,6 +416,7 @@ pub fn main(init: std.process.Init) !void {
         _ = zig.wait(io) catch {};
         return ;
     }
+    defer db.deinit() catch |e| fatal("failed to commit changes: {}", .{e});
 
     //
     // cli

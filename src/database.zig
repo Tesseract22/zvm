@@ -60,7 +60,7 @@ pub fn FileBuffer(comptime T: type) type {
         const Self = @This();
         const MAX_FETCH_SIZE = 1024 * 100;
         pub fn init(name: []const u8) Self {
-            const file = zvm_dir.createFile(io, name, .{ .truncate = false, .read = true, .lock = .exclusive })
+            const file = zvm_dir.createFile(io, name, .{ .truncate = false, .read = true, .lock = if (is_shim) .none else .exclusive })
                 catch |e| fatal("{}: cannot create file: {s}/{s}", .{ e, ZVM_STORAGE_PATH, name });
             const data: T = switch (T) {
                 []const u8 => &.{},
@@ -94,16 +94,17 @@ pub fn FileBuffer(comptime T: type) type {
         }
 
         pub fn commit(self: *Self) !void {
-            switch (T) {
-                []const u8 => {
-                    var buf: [64]u8 = undefined;
-                    var writer = self.file.writer(io, &buf);
-                    try writer.seekTo(0);
-                    try self.file.setLength(io, 0);
-                    try writer.interface.writeAll(self.data);
-                    try writer.flush();
+            if (!is_shim) {
+                switch (T) {
+                    []const u8 => {
+                        var buf: [64]u8 = undefined;
+                        var writer = self.file.writer(io, &buf);
+                        try writer.seekTo(0);
+                        try self.file.setLength(io, 0);
+                        try writer.interface.writeAll(self.data);
+                        try writer.flush();
 
-                },
+                    },
                 std.StringArrayHashMapUnmanaged(void) => {
                     var buf: [64]u8 = undefined;
                     var writer = self.file.writer(io, &buf);
@@ -118,6 +119,7 @@ pub fn FileBuffer(comptime T: type) type {
                     }
                 },
                 else => @compileError("Unsupported type: " ++ @typeName(T)),
+                }
             }
             self.file.close(io);
         }
@@ -249,6 +251,7 @@ pub var zvm_dir: Io.Dir = undefined; // $init_on_main
 pub var installation_dir: Io.Dir = undefined; // $init_on_main
 pub var arena: std.mem.Allocator = undefined; // $init_on_main
 pub var io: Io = undefined; // $init_on_main
+pub var is_shim = false;
 
 const main = @import("main.zig");
 
@@ -268,6 +271,7 @@ pub fn nuke() void {
 }
 
 pub fn init(io_: Io, self_path_abs: ?[]const u8) void {
+    is_shim = self_path_abs == null;
     io = io_;
     zvm_dir = Io.Dir.openDirAbsolute(io, zvm_path, .{ .iterate = true }) catch |e|
         if (e == error.FileNotFound) blk: {
@@ -324,6 +328,7 @@ pub fn fetch_if_force_or_empty(client: *std.http.Client, fetch: bool) void {
 }
 
 pub fn deinit() !void {
+    log.debug("database closed", .{});
     zvm_dir.close(io);
     installation_dir.close(io);
     try index_file.commit();

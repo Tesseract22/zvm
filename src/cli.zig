@@ -163,20 +163,20 @@ pub const ArgParser = struct {
                 var sub_it = self.sub_commands.iterator();
                 print("list of sub commands:\n", .{});
                 while (sub_it.next()) |sub| {
-                    print("\t{s} -- {s}\n", .{ sub.key_ptr.*, sub.value_ptr.*.desc });
+                    print("  {s: <20}{s}\n", .{ sub.key_ptr.*, sub.value_ptr.*.desc });
                 }
-                print("\t<sub-command> --help\tprint help of a particular subcommand\n\n", .{});
+                print("  <sub-command> --help  print help of a particular subcommand\n\n", .{});
             }
 
             for (self.postional_args.items) |positional| {
-                print("\t{s}\t{s}\n", .{ positional.meta_var_name, positional.desc });
+                print("  {s}\t{s}\n", .{ positional.meta_var_name, positional.desc });
             }
             var it = self.prefix_args.iterator();
             while (it.next()) |entry| {
                 const p = entry.value_ptr;
-                print("\t{s} {s}\t{s}\n", .{ entry.key_ptr.*, p.meta_var_name, p.desc });
+                print("  {s} {s}  {s}\n", .{ entry.key_ptr.*, p.meta_var_name, p.desc });
             }
-            print("\t--help\tprint this help message\n", .{});
+            print("  {s: <20}print this help message\n", .{ "--help" });
         }
 
         pub fn deinit(self: *Command, a: std.mem.Allocator) void {
